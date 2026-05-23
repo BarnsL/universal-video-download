@@ -1,0 +1,21 @@
+# OS / Editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Logs / temp
+*.log
+*.tmp
+
+# Local downloads while testing
+/downloads/
+*.mp4
+*.webm
+*.mkv
+*.m4a
+*.mp3
+*.srt
