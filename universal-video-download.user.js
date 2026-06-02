@@ -102,20 +102,20 @@
             top: 0;
             right: 10px;
             z-index: 999999;
-            padding: 4px 16px;
-            background: #e8e8e8;
-            color: #333;
-            border: 1px solid #ccc;
-            border-radius: 4px;
+            padding: 6px 20px;
+            background: #232f3e;
+            color: #ffffff;
+            border: 1px solid #3a4553;
+            border-radius: 20px;
             font-size: 12px;
-            font-weight: 400;
+            font-weight: 600;
             font-family: Arial, Helvetica, sans-serif;
             cursor: pointer;
             transition: background 0.15s;
             white-space: nowrap;
         }
         #uvd-atoz-btn:hover {
-            background: #d0d0d0;
+            background: #3a4a5c;
         }
 
         /* ===== Overlay & Dialog ===== */
@@ -1451,60 +1451,45 @@
     // ==================== AtoZ/Rustici Download Button ====================
     function injectAtozButton() {
         if (!CONFIG.supportedSites.atoz.test(location.hostname)) return;
-        if (document.getElementById('uvd-atoz-btn')) return;
 
-        // Look for the "Save and Exit" button to position relative to it
-        function findSaveAndExit() {
-            // Try the top-level page first
-            const candidates = document.querySelectorAll('button, a, input[type="button"]');
-            for (const el of candidates) {
-                const text = (el.textContent || el.value || '').trim().toLowerCase();
-                if (text.includes('save and exit') || text.includes('save & exit')) {
-                    return el;
-                }
+        // Remove any existing download button(s) to prevent duplicates
+        document.querySelectorAll('#uvd-atoz-btn').forEach(el => el.remove());
+
+        // Find the "Save and Exit" button
+        let saveBtn = null;
+        const candidates = document.querySelectorAll('button, a, input[type="button"], span[role="button"]');
+        for (const el of candidates) {
+            const text = (el.textContent || el.value || '').trim().toLowerCase();
+            if (text.includes('save and exit') || text.includes('save & exit')) {
+                saveBtn = el;
+                break;
             }
-            // Also check iframes (Rustici content is often in an iframe)
-            const iframes = document.querySelectorAll('iframe');
-            for (const iframe of iframes) {
-                try {
-                    const iDoc = iframe.contentDocument || iframe.contentWindow.document;
-                    const iCandidates = iDoc.querySelectorAll('button, a, input[type="button"]');
-                    for (const el of iCandidates) {
-                        const text = (el.textContent || el.value || '').trim().toLowerCase();
-                        if (text.includes('save and exit') || text.includes('save & exit')) {
-                            return el;
-                        }
-                    }
-                } catch(e) { /* cross-origin iframe, skip */ }
-            }
-            return null;
         }
 
-        const saveBtn = findSaveAndExit();
+        if (!saveBtn) return; // Wait until Save and Exit is available
+
         const btn = document.createElement('button');
         btn.id = 'uvd-atoz-btn';
         btn.textContent = 'Download Video';
         btn.addEventListener('click', showDialog);
 
-        if (saveBtn) {
-            // Position relative to the Save and Exit button
-            const rect = saveBtn.getBoundingClientRect();
-            btn.style.top = (rect.bottom + 20) + 'px';
-            btn.style.right = (window.innerWidth - rect.right) + 'px';
-            // Match the computed style of Save and Exit
-            const cs = window.getComputedStyle(saveBtn);
-            btn.style.padding = cs.padding || '4px 16px';
-            btn.style.fontSize = cs.fontSize || '12px';
-            btn.style.fontFamily = cs.fontFamily || 'Arial, Helvetica, sans-serif';
-            btn.style.borderRadius = cs.borderRadius || '4px';
-        } else {
-            // Fallback: position top-right with some offset
-            btn.style.top = '50px';
-            btn.style.right = '10px';
-        }
+        // Position: fixed, same X as Save and Exit, 20px below it
+        const rect = saveBtn.getBoundingClientRect();
+        btn.style.top = (rect.bottom + 20) + 'px';
+        btn.style.right = (window.innerWidth - rect.right) + 'px';
+
+        // Match computed style of Save and Exit
+        const cs = window.getComputedStyle(saveBtn);
+        btn.style.padding = cs.padding;
+        btn.style.fontSize = cs.fontSize;
+        btn.style.fontFamily = cs.fontFamily;
+        btn.style.borderRadius = cs.borderRadius;
+        btn.style.background = cs.backgroundColor;
+        btn.style.color = cs.color;
+        btn.style.border = cs.border;
+        btn.style.fontWeight = cs.fontWeight;
 
         document.body.appendChild(btn);
-        // Hide the circular FAB since we have the inline button
         hideFab();
     }
 
