@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @match        *://*/*
@@ -34,6 +34,7 @@
             facebook: /facebook\.com|fb\.watch/,
             instagram: /instagram\.com/,
             tiktok: /tiktok\.com/,
+            atoz: /atoz\.amazon\.work/,
             generic: /.*/
         }
     };
@@ -93,6 +94,28 @@
             align-items: center;
             justify-content: center;
             font-family: sans-serif;
+        }
+
+        /* ===== AtoZ/Rustici Inline Download Button ===== */
+        #uvd-atoz-btn {
+            position: fixed;
+            top: 0;
+            right: 10px;
+            z-index: 999999;
+            padding: 4px 16px;
+            background: #e8e8e8;
+            color: #333;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 400;
+            font-family: Arial, Helvetica, sans-serif;
+            cursor: pointer;
+            transition: background 0.15s;
+            white-space: nowrap;
+        }
+        #uvd-atoz-btn:hover {
+            background: #d0d0d0;
         }
 
         /* ===== Overlay & Dialog ===== */
@@ -1381,6 +1404,13 @@
         const videos = detectVideoElements();
         const hasVideo = videos.length > 0 || capturedStreams.length > 0;
 
+        // On AtoZ/Rustici, use inline button instead of FAB
+        if (CONFIG.supportedSites.atoz.test(location.hostname)) {
+            injectAtozButton();
+            hideFab();
+            return;
+        }
+
         // On YouTube, always show on /watch pages
         if (CONFIG.supportedSites.youtube.test(location.hostname) && location.pathname === '/watch') {
             showFab();
@@ -1418,6 +1448,66 @@
         container.appendChild(btn);
     }
 
+    // ==================== AtoZ/Rustici Download Button ====================
+    function injectAtozButton() {
+        if (!CONFIG.supportedSites.atoz.test(location.hostname)) return;
+        if (document.getElementById('uvd-atoz-btn')) return;
+
+        // Look for the "Save and Exit" button to position relative to it
+        function findSaveAndExit() {
+            // Try the top-level page first
+            const candidates = document.querySelectorAll('button, a, input[type="button"]');
+            for (const el of candidates) {
+                const text = (el.textContent || el.value || '').trim().toLowerCase();
+                if (text.includes('save and exit') || text.includes('save & exit')) {
+                    return el;
+                }
+            }
+            // Also check iframes (Rustici content is often in an iframe)
+            const iframes = document.querySelectorAll('iframe');
+            for (const iframe of iframes) {
+                try {
+                    const iDoc = iframe.contentDocument || iframe.contentWindow.document;
+                    const iCandidates = iDoc.querySelectorAll('button, a, input[type="button"]');
+                    for (const el of iCandidates) {
+                        const text = (el.textContent || el.value || '').trim().toLowerCase();
+                        if (text.includes('save and exit') || text.includes('save & exit')) {
+                            return el;
+                        }
+                    }
+                } catch(e) { /* cross-origin iframe, skip */ }
+            }
+            return null;
+        }
+
+        const saveBtn = findSaveAndExit();
+        const btn = document.createElement('button');
+        btn.id = 'uvd-atoz-btn';
+        btn.textContent = 'Download Video';
+        btn.addEventListener('click', showDialog);
+
+        if (saveBtn) {
+            // Position relative to the Save and Exit button
+            const rect = saveBtn.getBoundingClientRect();
+            btn.style.top = (rect.bottom + 20) + 'px';
+            btn.style.right = (window.innerWidth - rect.right) + 'px';
+            // Match the computed style of Save and Exit
+            const cs = window.getComputedStyle(saveBtn);
+            btn.style.padding = cs.padding || '4px 16px';
+            btn.style.fontSize = cs.fontSize || '12px';
+            btn.style.fontFamily = cs.fontFamily || 'Arial, Helvetica, sans-serif';
+            btn.style.borderRadius = cs.borderRadius || '4px';
+        } else {
+            // Fallback: position top-right with some offset
+            btn.style.top = '50px';
+            btn.style.right = '10px';
+        }
+
+        document.body.appendChild(btn);
+        // Hide the circular FAB since we have the inline button
+        hideFab();
+    }
+
     // ==================== INITIALIZATION ====================
     createFab();
 
@@ -1425,6 +1515,7 @@
     setTimeout(() => {
         scanForMedia();
         injectYouTubeButton();
+        injectAtozButton();
     }, 2000);
 
     // Periodic re-scan
