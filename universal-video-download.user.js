@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @match        *://*/*
@@ -541,18 +541,48 @@
     if (CONFIG.interceptNetworkRequests) {
         // Intercept XHR
         const origXHROpen = XMLHttpRequest.prototype.open;
+        const origXHRSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url) {
+            this.__uvd_url = url;
             if (url && typeof url === 'string') {
                 checkMediaUrl(url, 'xhr');
             }
             return origXHROpen.apply(this, arguments);
         };
+        // BUG-002 FIX: Also capture YouTube player API responses via XHR
+        XMLHttpRequest.prototype.send = function() {
+            if (this.__uvd_url && this.__uvd_url.includes('/youtubei/v1/player')) {
+                this.addEventListener('load', function() {
+                    try {
+                        const data = JSON.parse(this.responseText);
+                        if (data?.streamingData) {
+                            window.__uvd_ytPlayerResponse = data;
+                        }
+                    } catch(e) {}
+                });
+            }
+            return origXHRSend.apply(this, arguments);
+        };
 
         // Intercept fetch
         const origFetch = window.fetch;
-        window.fetch = function(input) {
+        window.fetch = function(input, init) {
             const url = typeof input === 'string' ? input : input?.url;
             if (url) checkMediaUrl(url, 'fetch');
+
+            // BUG-002 FIX: Intercept YouTube's player API responses on SPA navigations
+            // to capture streamingData that ytInitialPlayerResponse misses
+            if (url && url.includes('/youtubei/v1/player')) {
+                return origFetch.apply(this, arguments).then(response => {
+                    const clone = response.clone();
+                    clone.json().then(data => {
+                        if (data?.streamingData) {
+                            window.__uvd_ytPlayerResponse = data;
+                        }
+                    }).catch(() => {});
+                    return response;
+                });
+            }
             return origFetch.apply(this, arguments);
         };
 
@@ -673,14 +703,27 @@
     }
 
     // ==================== YOUTUBE EXTRACTOR ====================
+    // BUG-002: This extractor ONLY works on initial full page loads.
+    // YouTube is an SPA — navigating between videos (clicking links, playlist
+    // auto-advance, radio mixes) fetches player data via XHR to /youtubei/v1/player
+    // and NEVER updates window.ytInitialPlayerResponse or injects new <script> tags.
+    // All 3 methods below fail silently on SPA navigations, causing "No Streams Detected".
+    //
+    // FIX: Intercept fetch() calls to /youtubei/v1/player and cache the response.
+    // See BUGS.md (BUG-002, Option A) for implementation details.
     function extractYouTubeStreams() {
         if (!CONFIG.supportedSites.youtube.test(location.hostname)) return null;
         if (location.pathname !== '/watch' && !location.pathname.startsWith('/shorts/')) return null;
 
         let playerResponse = null;
 
+        // Method 0: Intercepted player API response (works on SPA navigations)
+        if (window.__uvd_ytPlayerResponse?.streamingData) {
+            playerResponse = window.__uvd_ytPlayerResponse;
+        }
+
         // Method 1: ytInitialPlayerResponse
-        if (window.ytInitialPlayerResponse?.streamingData) {
+        if (!playerResponse && window.ytInitialPlayerResponse?.streamingData) {
             playerResponse = window.ytInitialPlayerResponse;
         }
 
@@ -1193,6 +1236,12 @@
 
     function showEmptyDialog() {
         removeDialog();
+
+        // BUG-001: The bottom "Close" button below uses an inline onclick handler.
+        // YouTube's Content Security Policy (CSP) blocks inline event handlers on
+        // dynamically injected DOM. This makes the Close button non-functional.
+        // FIX: Replace inline onclick with addEventListener (same as #uvd-close and #uvd-rescan).
+        // See BUGS.md for full details.
         const overlay = document.createElement('div');
         overlay.id = 'uvd-overlay';
         overlay.innerHTML = `
@@ -1220,7 +1269,7 @@
                 <div class="uvd-footer">
                     <div class="uvd-actions">
                         <button class="uvd-btn uvd-btn-secondary" id="uvd-rescan">🔄 Rescan Page</button>
-                        <button class="uvd-btn uvd-btn-primary" onclick="document.getElementById('uvd-overlay').remove()">Close</button>
+                        <button class="uvd-btn uvd-btn-primary" id="uvd-close-btn">Close</button>
                     </div>
                 </div>
             </div>
@@ -1230,6 +1279,7 @@
 
         overlay.addEventListener('click', e => { if (e.target === overlay) removeDialog(); });
         overlay.querySelector('#uvd-close').addEventListener('click', removeDialog);
+        overlay.querySelector('#uvd-close-btn').addEventListener('click', removeDialog);
         overlay.querySelector('#uvd-rescan')?.addEventListener('click', () => {
             removeDialog();
             setTimeout(showDialog, 500);
