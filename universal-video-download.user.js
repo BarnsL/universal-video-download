@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.8.3
+// @version      2.8.4
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -2767,10 +2767,48 @@
     // aria-labels / titles, AND fall back to "right under the video
     // iframe" on sites that have no Download button at all (wcoanimedub
     // → embed.wcostream.com, plenty of similar mirror sites).
+    // v2.8.4 — Return true only if the current page has at least one
+    // signal that suggests it's a video page: a sufficiently large
+    // iframe, an in-page <video> element, or a captured media URL
+    // from the network interceptor. Prevents the inline button from
+    // attaching to random `download`-looking elements on non-video
+    // pages (GitHub file lists, doc anchors, etc.) when the
+    // NON_VIDEO_HOSTS_RE list doesn't catch them.
+    function hasAnyVideoEvidence() {
+        try {
+            if (typeof capturedStreams !== 'undefined' && capturedStreams.length > 0) return true;
+        } catch (_) {}
+        for (const v of document.querySelectorAll('video')) {
+            const r = v.getBoundingClientRect();
+            if (r.width >= 200 && r.height >= 120) return true;
+        }
+        for (const f of document.querySelectorAll('iframe')) {
+            const r = f.getBoundingClientRect();
+            if (r.width >= 320 && r.height >= 180) return true;
+        }
+        return false;
+    }
+
+    // v2.8.4 — Skip code-hosting / dev / docs sites entirely. They tend
+    // to have lots of `download` strings (filenames like
+    // download-certs.ps1, "Download ZIP" in repo headers, doc anchors,
+    // etc.) that the generic matcher would latch onto and produce a
+    // jarring blue button in the middle of a file list. Universal Video
+    // Download is for video sites; these aren't them.
+    const NON_VIDEO_HOSTS_RE = /(?:^|\.)(?:github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|sourceforge\.net|codeberg\.org|gitea\.com|launchpad\.net|stackoverflow\.com|stackexchange\.com|developer\.mozilla\.org|wikipedia\.org|wikimedia\.org|docs\.python\.org|nodejs\.org|npmjs\.com|pypi\.org|crates\.io|rubygems\.org|maven\.org|nuget\.org|godoc\.org|pkg\.go\.dev|hexdocs\.pm|hackage\.haskell\.org|microsoft\.com|learn\.microsoft\.com|apple\.com\/developer|developer\.apple\.com|developer\.android\.com|chromewebstore\.google\.com|addons\.mozilla\.org|tampermonkey\.net|mail\.google\.com|outlook\.live\.com|outlook\.office\.com|app\.slack\.com|notion\.so|atlassian\.net|linear\.app|claude\.ai|chatgpt\.com|chat\.openai\.com)$/i;
+
     function injectGenericSiteButton() {
         if (CONFIG.supportedSites.youtube.test(location.hostname)) return;
         if (CONFIG.supportedSites.atoz.test(location.hostname)) return;
+        if (NON_VIDEO_HOSTS_RE.test(location.hostname)) return;
         if (document.getElementById('uvd-site-btn')) return;
+        // v2.8.4 — only inject if there's actual video evidence on the
+        // page. Three signals are enough: an iframe that looks like a
+        // player (any host, just sized right), an in-page <video>
+        // element, or our network interceptor has already captured at
+        // least one media URL. Otherwise we wait — scanForMedia keeps
+        // running every 3s, so as soon as a player loads we react.
+        if (!hasAnyVideoEvidence()) return;
 
         // v2.8.3 — on episode pages, prefer the site's existing
         // "next episode" link as the anchor. The button stacks directly
