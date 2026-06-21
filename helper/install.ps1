@@ -113,28 +113,49 @@ if ($inUse) {
     Start-Sleep -Seconds 2
 }
 
-# 7. Health check.
-try {
-    $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 5
-    Write-Host "    Helper health: OK (v$($health.version))" -ForegroundColor Green
-    if ($health.tools.'yt-dlp')  { Write-Host "      yt-dlp: $($health.tools.'yt-dlp')" }
-    if ($health.tools.ffmpeg)    { Write-Host "      ffmpeg: $($health.tools.ffmpeg)" }
-    Write-Host "      Download dir: $($health.downloadDir)"
-} catch {
-    Write-Warning "    Helper not responding yet on port $port. It may still be starting. Run again or check: Get-ScheduledTaskInfo -TaskName uvd-helper"
+# 7. Health check (with backoff — first start can take ~3s).
+$healthOk = $false
+for ($i = 0; $i -lt 5; $i++) {
+    try {
+        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3
+        Write-Host "    Helper health: OK (v$($health.version))" -ForegroundColor Green
+        if ($health.tools.'yt-dlp')  { Write-Host "      yt-dlp: $($health.tools.'yt-dlp')" }
+        if ($health.tools.ffmpeg)    { Write-Host "      ffmpeg: $($health.tools.ffmpeg)" }
+        Write-Host "      Download dir: $($health.downloadDir)"
+        if ($health.queue) {
+            Write-Host "      Queue: max $($health.config.maxConcurrent) concurrent, $($health.config.maxConcurrentPerHost)/host, retries $($health.config.maxRetries)"
+        }
+        $healthOk = $true
+        break
+    } catch {
+        Start-Sleep -Milliseconds 800
+    }
+}
+if (-not $healthOk) {
+    Write-Warning "    Helper not responding yet on port $port. It may still be starting. Re-run install.ps1 or restart the Startup launcher."
 }
 
-# 8. Token to clipboard.
+# 8. Token to clipboard + open /setup page in default browser so the
+#    user lands on a guided "install the userscript + paste token"
+#    flow without having to read another README.
 Set-Clipboard -Value $token
+$setupUrl = "http://127.0.0.1:$port/setup"
 Write-Host ""
 Write-Host "==> DONE" -ForegroundColor Green
 Write-Host "Token (copied to clipboard):"
 Write-Host "  $token" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "Next step: open any tab where the userscript runs (e.g. youtube.com),"
-Write-Host "open the download dialog (Ctrl+Shift+D), click the gear icon, and"
-Write-Host "paste the token. After that, Download just works -- no clipboard"
-Write-Host "round-trip, no terminal."
+if ($healthOk) {
+    Write-Host "Opening the helper's setup page in your default browser..."
+    Write-Host "  $setupUrl"
+    Start-Process $setupUrl
+    Write-Host ""
+    Write-Host "If the page didn't open, paste that URL into your browser. The page"
+    Write-Host "walks you through installing the userscript and finishing setup."
+} else {
+    Write-Host "Once the helper comes up, open: $setupUrl"
+    Write-Host "It walks you through installing the userscript and finishing setup."
+}
 Write-Host ""
 $uninst = 'Stop-Process -Name pythonw -ErrorAction SilentlyContinue; Remove-Item "' + $vbsPath + '" -ErrorAction SilentlyContinue; Remove-Item -Recurse "' + $InstallDir + '"'
 Write-Host "Uninstall:  $uninst"

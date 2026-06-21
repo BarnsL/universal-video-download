@@ -21,20 +21,23 @@ Dependencies: stdlib only. Requires yt-dlp + ffmpeg on PATH.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "1.0.5"
+VERSION = "1.1.0"
 
 
 _real_print = print  # capture before any further indirection
@@ -156,6 +159,23 @@ def pick_writable_download_dir() -> str:
     return str(fallback)
 
 
+CONFIG_DEFAULTS = {
+    "port": DEFAULT_PORT,
+    # Queue & retry knobs (v1.1.0).
+    # maxConcurrent caps total active downloads; maxConcurrentPerHost
+    # prevents hammering a single site (mostly YouTube anti-bot).
+    # maxRetries + retryBackoffSeconds drive exponential backoff on
+    # transient yt-dlp failures. minFreeDiskMB skips spawning a job if
+    # the download volume is below that threshold so we don't fill the
+    # disk and leave a corrupted partial file.
+    "maxConcurrent": 2,
+    "maxConcurrentPerHost": 2,
+    "maxRetries": 3,
+    "retryBackoffSeconds": 30,
+    "minFreeDiskMB": 200,
+}
+
+
 def load_or_init_config() -> dict:
     cfg_dir = config_dir()
     cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -165,7 +185,8 @@ def load_or_init_config() -> dict:
             cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
             # Backfill missing keys when older configs exist.
             cfg.setdefault("token", secrets.token_hex(32))
-            cfg.setdefault("port", DEFAULT_PORT)
+            for k, v in CONFIG_DEFAULTS.items():
+                cfg.setdefault(k, v)
             # If a previous config recorded a path that no longer works
             # (e.g. broken Downloads junction), re-pick. Don't trash a
             # user-edited valid path.
@@ -185,8 +206,8 @@ def load_or_init_config() -> dict:
             safe_print(f"warn: config unreadable ({e}); regenerating", file=sys.stderr)
     cfg = {
         "token": secrets.token_hex(32),
-        "port": DEFAULT_PORT,
         "downloadDir": pick_writable_download_dir(),
+        **CONFIG_DEFAULTS,
     }
     cfg_file.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     # Lock down on POSIX so other users can't read the token.
@@ -240,16 +261,30 @@ def sanitize_filename(name: str) -> str:
 
 
 class Job:
-    """One yt-dlp invocation. Lives in `JOBS`."""
+    """One yt-dlp invocation. Lives in `JOBS`.
+
+    v1.1.0 fields support queueing/retry:
+      - priority: higher runs first (default 0)
+      - created_at: tie-breaker for FIFO within the same priority
+      - retry_count: number of times this job has been retried so far
+      - retry_at: epoch seconds; queue dispatcher skips this job until
+        time.time() >= retry_at (used for exponential backoff)
+      - host: extracted from payload['url'], used by per-host concurrency
+      - cancel_requested: set to True by the cancel endpoint; the worker
+        polls it and terminates yt-dlp + skips remaining retries
+    """
 
     __slots__ = (
         "id", "payload", "status", "progress", "bytes_downloaded",
         "bytes_total", "eta", "speed", "output_path", "error",
         "started_at", "finished_at", "log_lines", "process", "thread",
+        # v1.1.0 additions
+        "priority", "created_at", "retry_count", "retry_at",
+        "host", "cancel_requested",
     )
 
-    def __init__(self, payload: dict):
-        self.id: str = uuid.uuid4().hex[:12]
+    def __init__(self, payload: dict, jid: str | None = None):
+        self.id: str = jid or uuid.uuid4().hex[:12]
         self.payload: dict = payload
         self.status: str = "queued"  # queued | running | done | error | cancelled
         self.progress: float = 0.0
@@ -264,8 +299,16 @@ class Job:
         self.log_lines: list[str] = []
         self.process: subprocess.Popen | None = None
         self.thread: threading.Thread | None = None
+        # v1.1.0
+        self.priority: int = int(payload.get("priority") or 0)
+        self.created_at: float = time.time()
+        self.retry_count: int = 0
+        self.retry_at: float = 0.0
+        self.host: str = _extract_host(payload.get("url") or "")
+        self.cancel_requested: bool = False
 
     def to_dict(self) -> dict:
+        """Snapshot for the wire. Stable shape — the userscript reads this."""
         return {
             "id": self.id,
             "status": self.status,
@@ -281,13 +324,107 @@ class Job:
             "filename": self.payload.get("filename"),
             "url": self.payload.get("url"),
             "type": self.payload.get("type"),
+            "priority": self.priority,
+            "createdAt": self.created_at,
+            "retryCount": self.retry_count,
+            "retryAt": self.retry_at,
+            "host": self.host,
         }
+
+    def to_persist(self) -> dict:
+        """Persistent snapshot — includes payload so we can re-run on
+        next helper start. Log lines + transient subprocess handle are
+        omitted on purpose (logs are huge and don't matter after a
+        restart; the Popen can't be serialised at all)."""
+        return {**self.to_dict(), "payload": self.payload}
+
+    @classmethod
+    def from_persist(cls, d: dict) -> "Job":
+        j = cls(d.get("payload") or {}, jid=d.get("id"))
+        j.status = d.get("status") or "queued"
+        # Anything that was "running" when the helper died gets
+        # requeued — yt-dlp's --no-overwrites + --continue make this
+        # safe most of the time, but we err on the side of re-running
+        # from scratch.
+        if j.status == "running":
+            j.status = "queued"
+        j.progress = float(d.get("progress") or 0)
+        j.bytes_downloaded = int(d.get("bytesDownloaded") or 0)
+        j.bytes_total = int(d.get("bytesTotal") or 0)
+        j.eta = d.get("eta")
+        j.speed = d.get("speed")
+        j.output_path = d.get("outputPath")
+        j.error = d.get("error")
+        j.started_at = d.get("startedAt")
+        j.finished_at = d.get("finishedAt")
+        j.priority = int(d.get("priority") or 0)
+        j.created_at = float(d.get("createdAt") or time.time())
+        j.retry_count = int(d.get("retryCount") or 0)
+        j.retry_at = float(d.get("retryAt") or 0)
+        j.host = d.get("host") or _extract_host(j.payload.get("url") or "")
+        return j
+
+
+def _extract_host(url: str) -> str:
+    try:
+        n = urlparse(url).netloc.lower()
+        # Group all youtube.com / youtu.be variants under one bucket.
+        if n.endswith("youtube.com") or n == "youtu.be":
+            return "youtube"
+        if n.endswith("vimeo.com"):
+            return "vimeo"
+        return n or "unknown"
+    except Exception:
+        return "unknown"
 
 
 JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
+JOBS_CV = threading.Condition(JOBS_LOCK)
+QUEUE_PAUSED = False
 CONFIG = load_or_init_config()
 DOWNLOAD_DIR = Path(CONFIG["downloadDir"])
+
+JOBS_FILE = config_dir() / "jobs.json"
+
+
+def persist_jobs() -> None:
+    """Atomically write the current JOBS snapshot to disk so that an
+    abrupt helper exit (reboot, OOM, taskkill) doesn't lose the queue.
+    Atomic-ish: write to .tmp, then os.replace onto the real file.
+
+    Called after every status transition. Cheap — the queue is bounded
+    to MAX_JOBS_KEPT entries."""
+    try:
+        with JOBS_LOCK:
+            snapshot = [j.to_persist() for j in JOBS.values()]
+        tmp = JOBS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        os.replace(tmp, JOBS_FILE)
+    except OSError:
+        # Disk full / permission issue / config dir gone. Persistence
+        # is best-effort; in-memory queue keeps working.
+        pass
+
+
+def restore_jobs() -> None:
+    """Re-populate JOBS from jobs.json at startup."""
+    if not JOBS_FILE.exists():
+        return
+    try:
+        raw = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        safe_print(f"warn: jobs.json unreadable ({e})", file=sys.stderr)
+        return
+    if not isinstance(raw, list):
+        return
+    with JOBS_LOCK:
+        for d in raw:
+            try:
+                j = Job.from_persist(d)
+                JOBS[j.id] = j
+            except Exception:
+                continue
 
 
 def _probe_tools_once() -> dict:
@@ -342,19 +479,6 @@ def ensure_dir(p: Path) -> None:
 ensure_dir(DOWNLOAD_DIR)
 
 
-def evict_old_jobs() -> None:
-    """Keep memory bounded — drop finished jobs past MAX_JOBS_KEPT."""
-    with JOBS_LOCK:
-        if len(JOBS) <= MAX_JOBS_KEPT:
-            return
-        finished = sorted(
-            (j for j in JOBS.values() if j.status in {"done", "error", "cancelled"}),
-            key=lambda j: j.finished_at or "",
-        )
-        for j in finished[: len(JOBS) - MAX_JOBS_KEPT]:
-            JOBS.pop(j.id, None)
-
-
 def build_ytdlp_argv(payload: dict) -> tuple[list[str], str]:
     """Translate a download payload into yt-dlp argv + output template.
 
@@ -394,20 +518,20 @@ def build_ytdlp_argv(payload: dict) -> tuple[list[str], str]:
     return argv, output_template
 
 
-def run_job(job: Job) -> None:
-    job.status = "running"
-    job.started_at = now_iso()
+def _spawn_ytdlp_and_track(job: Job) -> int:
+    """Single yt-dlp invocation. Returns the process exit code. Updates
+    job progress/bytes/speed/eta/output_path/log_lines as output streams.
+
+    Separate from the retry loop so the loop can decide whether to
+    re-spawn based on the exit code alone."""
     try:
         argv, _ = build_ytdlp_argv(job.payload)
     except Exception as e:
-        job.status = "error"
-        job.error = f"bad payload: {e}"
-        job.finished_at = now_iso()
-        return
+        job.log_lines.append(f"[uvd-helper] bad payload: {e}")
+        return 2
 
     creationflags = 0
     if sys.platform == "win32":
-        # Hide the conhost flash for the spawned yt-dlp.
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     try:
@@ -421,21 +545,23 @@ def run_job(job: Job) -> None:
             creationflags=creationflags,
         )
     except FileNotFoundError:
-        job.status = "error"
-        job.error = (
-            "yt-dlp not found on PATH. Install with: winget install yt-dlp.yt-dlp"
+        job.log_lines.append(
+            "[uvd-helper] yt-dlp not found on PATH. "
+            "Install with: winget install yt-dlp.yt-dlp"
         )
-        job.finished_at = now_iso()
-        return
+        return 127
     except Exception as e:
-        job.status = "error"
-        job.error = f"spawn failed: {e}"
-        job.finished_at = now_iso()
-        return
+        job.log_lines.append(f"[uvd-helper] spawn failed: {e}")
+        return 1
 
     output_path: str | None = None
     assert job.process.stdout is not None
     for line in job.process.stdout:
+        if job.cancel_requested:
+            try:
+                job.process.terminate()
+            except OSError:
+                pass
         line = line.rstrip("\r\n")
         if not line:
             continue
@@ -443,9 +569,6 @@ def run_job(job: Job) -> None:
         if len(job.log_lines) > MAX_LOG_LINES:
             del job.log_lines[: len(job.log_lines) - MAX_LOG_LINES]
 
-        # Find the final on-disk path. yt-dlp emits Destination: on the
-        # raw download; Merger emits the post-merge path; "already been
-        # downloaded" covers re-runs.
         for rx in (DEST_RE, MERGE_RE, ALREADY_RE):
             m = rx.match(line)
             if m:
@@ -468,19 +591,164 @@ def run_job(job: Job) -> None:
                 job.bytes_downloaded = int(job.bytes_total * job.progress / 100)
 
     rc = job.process.wait()
-    job.finished_at = now_iso()
-    if job.status == "cancelled":
-        return  # leave fields as-is
-    if rc == 0:
-        job.status = "done"
-        job.progress = 100.0
-        job.output_path = output_path or str(DOWNLOAD_DIR)
-    else:
-        job.status = "error"
-        # Surface the last few lines so the UI can show something useful.
-        tail = "\n".join(job.log_lines[-6:]) if job.log_lines else ""
-        job.error = tail or f"yt-dlp exited with code {rc}"
-    evict_old_jobs()
+    if output_path:
+        job.output_path = output_path
+    return rc
+
+
+# yt-dlp exit codes that are clearly fatal (no point retrying): 127
+# means "command not found" (PATH issue we report once); 2 means bad
+# argv / bad payload — same flag will fail every time. Anything else
+# we treat as potentially-transient (rate limit, signature change,
+# socket reset, etc.) and retry with backoff.
+NON_RETRYABLE_EXIT_CODES = {2, 127}
+
+
+def run_job_worker(job: Job) -> None:
+    """Run a job, retrying on transient failures up to maxRetries.
+
+    Called in its own thread by the queue dispatcher. Owns the
+    transition of job.status from 'running' -> 'done' | 'error' |
+    'cancelled', or back to 'queued' (with a retry_at in the future)
+    when a retry is scheduled."""
+    job.status = "running"
+    job.started_at = job.started_at or now_iso()
+    persist_jobs()
+
+    while True:
+        rc = _spawn_ytdlp_and_track(job)
+
+        if job.cancel_requested:
+            with JOBS_CV:
+                job.status = "cancelled"
+                job.finished_at = now_iso()
+                JOBS_CV.notify_all()
+            persist_jobs()
+            return
+
+        if rc == 0:
+            with JOBS_CV:
+                job.status = "done"
+                job.progress = 100.0
+                job.finished_at = now_iso()
+                if not job.output_path:
+                    job.output_path = str(DOWNLOAD_DIR)
+                JOBS_CV.notify_all()
+            persist_jobs()
+            evict_old_jobs()
+            return
+
+        # Non-retryable failure modes — surface and stop.
+        if rc in NON_RETRYABLE_EXIT_CODES or job.retry_count >= int(CONFIG["maxRetries"]):
+            with JOBS_CV:
+                job.status = "error"
+                tail = "\n".join(job.log_lines[-6:]) if job.log_lines else ""
+                job.error = tail or f"yt-dlp exited with code {rc}"
+                job.finished_at = now_iso()
+                JOBS_CV.notify_all()
+            persist_jobs()
+            evict_old_jobs()
+            return
+
+        # Retry with exponential backoff. Going back to 'queued' so the
+        # dispatcher reclaims the slot and can run another job while we
+        # wait — we just bump retry_at into the future and the
+        # dispatcher's pick_next_job() will skip us until then.
+        job.retry_count += 1
+        backoff = int(CONFIG["retryBackoffSeconds"]) * (2 ** (job.retry_count - 1))
+        with JOBS_CV:
+            job.status = "queued"
+            job.retry_at = time.time() + backoff
+            job.log_lines.append(
+                f"[uvd-helper] yt-dlp exited {rc}; retry "
+                f"{job.retry_count}/{CONFIG['maxRetries']} in {backoff}s"
+            )
+            JOBS_CV.notify_all()
+        persist_jobs()
+        return  # dispatcher will re-pick us at retry_at
+
+
+def pick_next_job_locked() -> Job | None:
+    """Pick the next eligible queued job. JOBS_LOCK MUST be held.
+
+    Eligibility:
+      - status == 'queued' and not held back by retry_at
+      - host hasn't already hit maxConcurrentPerHost
+      - enough free disk for a sensible download (heuristic)
+    Order:
+      - higher priority first
+      - earlier created_at first (FIFO within priority)"""
+    if QUEUE_PAUSED:
+        return None
+    now = time.time()
+    queued = sorted(
+        (j for j in JOBS.values()
+         if j.status == "queued" and j.retry_at <= now),
+        key=lambda j: (-j.priority, j.created_at),
+    )
+    if not queued:
+        return None
+    host_counts: dict[str, int] = {}
+    for j in JOBS.values():
+        if j.status == "running":
+            host_counts[j.host] = host_counts.get(j.host, 0) + 1
+    per_host_cap = int(CONFIG["maxConcurrentPerHost"])
+    min_free = int(CONFIG["minFreeDiskMB"]) * 1024 * 1024
+    for j in queued:
+        if host_counts.get(j.host, 0) >= per_host_cap:
+            continue
+        try:
+            if shutil.disk_usage(DOWNLOAD_DIR).free < min_free:
+                # Don't start new jobs when disk is nearly full.
+                # Existing running jobs are left alone — yt-dlp will
+                # error out if it really runs out of space.
+                return None
+        except OSError:
+            pass
+        return j
+    return None
+
+
+def queue_dispatcher_loop() -> None:
+    """Single dispatcher thread. Wakes on JOBS_CV, claims an eligible
+    job, spawns a worker thread, repeats. Idle when nothing's
+    eligible."""
+    while True:
+        with JOBS_CV:
+            while True:
+                running = sum(1 for j in JOBS.values() if j.status == "running")
+                if running >= int(CONFIG["maxConcurrent"]):
+                    JOBS_CV.wait(timeout=5)
+                    continue
+                cand = pick_next_job_locked()
+                if cand is None:
+                    # Wake on cv.notify_all() or every 5s so retry_at
+                    # comebacks aren't missed indefinitely.
+                    JOBS_CV.wait(timeout=5)
+                    continue
+                # Reserve the slot before releasing the lock so two
+                # dispatcher rounds can't claim the same job.
+                cand.status = "running"
+                cand.started_at = cand.started_at or now_iso()
+                break
+        # Out of the lock — spawn worker.
+        t = threading.Thread(target=run_job_worker, args=(cand,), daemon=True)
+        cand.thread = t
+        t.start()
+
+
+def evict_old_jobs() -> None:
+    """Keep memory bounded — drop finished jobs past MAX_JOBS_KEPT."""
+    with JOBS_LOCK:
+        if len(JOBS) <= MAX_JOBS_KEPT:
+            return
+        finished = sorted(
+            (j for j in JOBS.values() if j.status in {"done", "error", "cancelled"}),
+            key=lambda j: j.finished_at or "",
+        )
+        for j in finished[: len(JOBS) - MAX_JOBS_KEPT]:
+            JOBS.pop(j.id, None)
+    persist_jobs()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -584,13 +852,31 @@ class Handler(BaseHTTPRequestHandler):
             # Intentionally unauthenticated so the userscript can detect
             # helper presence before it has a token. We do NOT return the
             # token here. We DO confirm tools are usable.
-            tools = self._probe_tools()
+            tools = _tools_cache
+            with JOBS_LOCK:
+                queue_stats = _queue_stats_locked()
             self._send_json(200, {
                 "status": "ok",
                 "version": VERSION,
                 "downloadDir": str(DOWNLOAD_DIR),
                 "tools": tools,
+                "queue": queue_stats,
+                "paused": QUEUE_PAUSED,
+                "config": {
+                    "maxConcurrent": CONFIG["maxConcurrent"],
+                    "maxConcurrentPerHost": CONFIG["maxConcurrentPerHost"],
+                    "maxRetries": CONFIG["maxRetries"],
+                },
             })
+            return
+
+        if path == "/setup":
+            # Friendly HTML landing page used by the installer. Shows
+            # the token, with a Copy button, plus a one-click link to
+            # install the userscript. Unauthenticated by design — it's
+            # only reachable from 127.0.0.1, and the token IS the auth
+            # bootstrap so it has to come from somewhere.
+            self._send_setup_page()
             return
 
         if not self._check_auth():
@@ -600,6 +886,17 @@ class Handler(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 snapshot = [j.to_dict() for j in JOBS.values()]
             self._send_json(200, {"jobs": snapshot})
+            return
+
+        if path == "/queue":
+            with JOBS_LOCK:
+                snapshot = [j.to_dict() for j in JOBS.values()]
+                stats = _queue_stats_locked()
+            self._send_json(200, {
+                "jobs": snapshot,
+                "stats": stats,
+                "paused": QUEUE_PAUSED,
+            })
             return
 
         parts = [p for p in path.split("/") if p]
@@ -617,12 +914,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"log": job.log_lines[-200:]})
                 return
             if len(parts) == 3 and parts[2] == "cancel":
-                if job.process and job.process.poll() is None:
-                    job.status = "cancelled"
-                    try:
-                        job.process.terminate()
-                    except OSError:
-                        pass
+                with JOBS_CV:
+                    job.cancel_requested = True
+                    if job.process and job.process.poll() is None:
+                        try:
+                            job.process.terminate()
+                        except OSError:
+                            pass
+                    if job.status == "queued":
+                        # Wasn't running yet — flip directly to cancelled.
+                        job.status = "cancelled"
+                        job.finished_at = now_iso()
+                    JOBS_CV.notify_all()
+                persist_jobs()
+                self._send_json(200, job.to_dict())
+                return
+            if len(parts) == 3 and parts[2] == "retry":
+                with JOBS_CV:
+                    if job.status in {"error", "cancelled"}:
+                        job.status = "queued"
+                        job.retry_count = 0
+                        job.retry_at = 0.0
+                        job.cancel_requested = False
+                        job.error = None
+                        job.finished_at = None
+                        JOBS_CV.notify_all()
+                persist_jobs()
                 self._send_json(200, job.to_dict())
                 return
 
@@ -653,11 +970,58 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             job = Job(payload)
-            with JOBS_LOCK:
+            with JOBS_CV:
                 JOBS[job.id] = job
-            job.thread = threading.Thread(target=run_job, args=(job,), daemon=True)
-            job.thread.start()
+                # Wake the dispatcher so it picks the new job up
+                # immediately if there's a free slot.
+                JOBS_CV.notify_all()
+            persist_jobs()
             self._send_json(202, job.to_dict())
+            return
+
+        if path == "/queue/pause":
+            global QUEUE_PAUSED
+            QUEUE_PAUSED = True
+            self._send_json(200, {"paused": True})
+            return
+
+        if path == "/queue/resume":
+            QUEUE_PAUSED = False
+            with JOBS_CV:
+                JOBS_CV.notify_all()
+            self._send_json(200, {"paused": False})
+            return
+
+        if path == "/queue/clear-completed":
+            with JOBS_LOCK:
+                removed = [
+                    jid for jid, j in JOBS.items()
+                    if j.status in {"done", "error", "cancelled"}
+                ]
+                for jid in removed:
+                    JOBS.pop(jid, None)
+            persist_jobs()
+            self._send_json(200, {"removed": len(removed)})
+            return
+
+        if path == "/queue/cancel-all":
+            with JOBS_CV:
+                affected = 0
+                for j in JOBS.values():
+                    if j.status in {"queued", "running"}:
+                        j.cancel_requested = True
+                        if j.process and j.process.poll() is None:
+                            try:
+                                j.process.terminate()
+                            except OSError:
+                                pass
+                        if j.status == "queued":
+                            j.status = "cancelled"
+                            j.finished_at = now_iso()
+                        affected += 1
+                JOBS_CV.notify_all()
+            persist_jobs()
+            self._send_json(200, {"cancelled": affected})
             return
 
         if path == "/open-download-dir":
@@ -677,14 +1041,136 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_json(404, {"error": "not found"})
 
-    # --- introspection ----------------------------------------------------
+    def _send_setup_page(self) -> None:
+        """Serve the /setup HTML page.
 
-    def _probe_tools(self) -> dict:
-        # Probe is expensive (subprocess startup) and the answer doesn't
-        # change inside a single helper run, so cache it at module
-        # level. /health hits this per request and was taking ~6s
-        # before the cache, blowing past the userscript's 2.5s timeout.
-        return _tools_cache
+        Token IS shown in the page DOM — this endpoint exists so the
+        installer can fire-and-forget open it in the browser and the
+        user has one screen with everything they need (token + copy
+        button + userscript install link). 127.0.0.1-only bind ensures
+        no other machine can read it. We also send X-Content-Type-Options
+        and a tight CSP so the page can't be embedded/exfiltrated."""
+        userscript_url = (
+            "https://raw.githubusercontent.com/BarnsL/universal-video-download/"
+            "main/universal-video-download.user.js"
+        )
+        tampermonkey_url = "https://www.tampermonkey.net/"
+        token_html = html.escape(CONFIG["token"])
+        dl_html = html.escape(str(DOWNLOAD_DIR))
+        body = f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>uvd-helper setup</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ background: #0f0f10; color: #e7e7ea; font-family: -apple-system,
+         BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 720px; margin: 40px auto; padding: 0 20px;
+         line-height: 1.55; }}
+  h1 {{ font-size: 22px; }}
+  h2 {{ font-size: 16px; margin-top: 28px; color: #a8a8b3; font-weight: 500; }}
+  .step {{ background: #1a1a1c; border: 1px solid #2a2a2f;
+          border-radius: 10px; padding: 16px 18px; margin: 12px 0; }}
+  .num {{ display: inline-flex; width: 22px; height: 22px;
+         border-radius: 50%; background: #6366f1; color: white;
+         align-items: center; justify-content: center;
+         font-weight: 600; font-size: 13px; margin-right: 8px; }}
+  code {{ background: #0a0a0b; padding: 2px 6px; border-radius: 4px;
+         font-family: ui-monospace, Consolas, monospace; color: #c4b5fd; }}
+  input {{ background: #0a0a0b; color: #c4b5fd; border: 1px solid #2a2a2f;
+          border-radius: 6px; padding: 10px 12px; width: 100%;
+          font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+          box-sizing: border-box; }}
+  button {{ background: #6366f1; color: white; border: none;
+           border-radius: 6px; padding: 10px 16px; font-size: 13px;
+           cursor: pointer; font-weight: 500; }}
+  button:hover {{ background: #5158d8; }}
+  .copy-row {{ display: grid; grid-template-columns: 1fr auto;
+              gap: 8px; margin: 10px 0; }}
+  a {{ color: #a5b4fc; }}
+  .ok {{ color: #86efac; }}
+  .hint {{ color: #888; font-size: 12px; margin-top: 6px; }}
+</style></head><body>
+<h1>uvd-helper is running <span class="ok">●</span></h1>
+<p>Version {VERSION}. Downloads land in <code>{dl_html}</code>.</p>
+<h2>Three steps to finish setup</h2>
+<div class="step">
+  <p><span class="num">1</span><strong>Install Tampermonkey</strong> in your
+  browser if you haven't already.</p>
+  <p><a href="{tampermonkey_url}" target="_blank">tampermonkey.net</a> —
+  works on Chrome, Edge, Brave, Firefox, Safari. On Chromium 138+ also
+  enable <em>"Allow User Scripts"</em> on the Tampermonkey card in
+  <code>chrome://extensions</code>.</p>
+</div>
+<div class="step">
+  <p><span class="num">2</span><strong>Install the userscript</strong>.</p>
+  <p><a href="{userscript_url}" target="_blank">Open the raw script URL</a> —
+  Tampermonkey will detect it and offer to install.</p>
+</div>
+<div class="step">
+  <p><span class="num">3</span><strong>Paste the access token</strong> into
+  the userscript's Settings panel.</p>
+  <div class="copy-row">
+    <input id="tok" value="{token_html}" readonly>
+    <button id="cp">Copy</button>
+  </div>
+  <p class="hint">Open any supported site (e.g. youtube.com), press
+  <code>Ctrl+Shift+D</code>, click <code>⚙️ Settings</code>, paste,
+  Save. After that the Download button just works.</p>
+</div>
+<h2>Anytime references</h2>
+<p>Token also retrievable from a terminal:
+<code>python "%LOCALAPPDATA%\\uvd-helper\\uvd-helper.py" --print-token</code></p>
+<p>Helper config:
+<code>%LOCALAPPDATA%\\uvd-helper\\config.json</code> (edit + restart task
+to change download dir, port, concurrency).</p>
+<script>
+  const inp = document.getElementById('tok');
+  const btn = document.getElementById('cp');
+  btn.addEventListener('click', async () => {{
+    try {{ await navigator.clipboard.writeText(inp.value); }}
+    catch (e) {{ inp.select(); document.execCommand('copy'); }}
+    btn.textContent = '✅ Copied';
+    setTimeout(() => btn.textContent = 'Copy', 1500);
+  }});
+</script>
+</body></html>"""
+        data = body.encode("utf-8")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # Keep the page self-contained — no fonts or images from
+            # outside. Tight CSP makes accidental data exfil harder.
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; img-src data:; connect-src 'none'"
+            )
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+
+
+def _queue_stats_locked() -> dict:
+    """Aggregate counts for the queue. Caller must hold JOBS_LOCK."""
+    counts = {"queued": 0, "running": 0, "done": 0, "error": 0, "cancelled": 0}
+    bytes_downloaded = 0
+    bytes_total = 0
+    for j in JOBS.values():
+        counts[j.status] = counts.get(j.status, 0) + 1
+        if j.status == "running":
+            bytes_downloaded += j.bytes_downloaded
+            bytes_total += j.bytes_total
+    return {
+        "total": len(JOBS),
+        "byStatus": counts,
+        "activeBytesDownloaded": bytes_downloaded,
+        "activeBytesTotal": bytes_total,
+    }
 
 
 def main() -> int:
@@ -696,6 +1182,15 @@ def main() -> int:
                          indent=2))
         return 0
 
+    # Restore the persisted queue from the previous helper run. Any
+    # jobs that were 'running' when we last died get bumped back to
+    # 'queued' so the dispatcher picks them up again.
+    restore_jobs()
+
+    # Single queue dispatcher thread. Workers spawn off it.
+    dispatcher = threading.Thread(target=queue_dispatcher_loop, daemon=True)
+    dispatcher.start()
+
     port = int(CONFIG.get("port", DEFAULT_PORT))
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -705,6 +1200,10 @@ def main() -> int:
     safe_print(f"uvd-helper v{VERSION} listening on http://127.0.0.1:{port}")
     safe_print(f"  config:    {config_dir() / 'config.json'}")
     safe_print(f"  downloads: {DOWNLOAD_DIR}")
+    safe_print(f"  queue:     max {CONFIG['maxConcurrent']} concurrent, "
+               f"{CONFIG['maxConcurrentPerHost']}/host, "
+               f"retries {CONFIG['maxRetries']} (backoff {CONFIG['retryBackoffSeconds']}s)")
+    safe_print("  setup:     http://127.0.0.1:%d/setup" % port)
     safe_print("  token:     (use --print-token to retrieve; paste into the userscript settings)")
     try:
         server.serve_forever()

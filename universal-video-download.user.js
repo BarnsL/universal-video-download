@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.5.3
+// @version      2.6.0
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -779,6 +779,136 @@
             white-space: pre-wrap;
             word-break: break-all;
         }
+
+        /* ===== v2.6.0: queue toast + queue panel ===== */
+        .uvd-queue-toast {
+            position: absolute;
+            left: 50%;
+            bottom: 18px;
+            transform: translate(-50%, 120%);
+            background: #14532d;
+            color: #bbf7d0;
+            border-radius: 8px;
+            padding: 8px 14px;
+            font-size: 12px;
+            opacity: 0;
+            transition: opacity 0.25s ease, transform 0.25s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            white-space: nowrap;
+            max-width: 80%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+            z-index: 5;
+        }
+        .uvd-queue-toast.show {
+            opacity: 1;
+            transform: translate(-50%, 0);
+        }
+        .uvd-queue-toast code {
+            color: #fff;
+            font-family: ui-monospace, Consolas, monospace;
+            background: rgba(0,0,0,0.25);
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+        }
+        .uvd-toast-link {
+            background: transparent;
+            border: 1px solid rgba(187, 247, 208, 0.5);
+            color: #bbf7d0;
+            border-radius: 6px;
+            padding: 3px 10px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .uvd-toast-link:hover { background: rgba(187, 247, 208, 0.1); }
+
+        .uvd-queue-panel {
+            padding: 18px 22px 22px;
+        }
+        .uvd-queue-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 14px;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .uvd-queue-head-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .uvd-queue-sub {
+            color: #888;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+        .uvd-queue-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 56vh;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+        .uvd-q-row {
+            background: #161616;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            padding: 10px 12px;
+        }
+        .uvd-q-row-top {
+            display: grid;
+            grid-template-columns: max-content 1fr auto;
+            gap: 10px;
+            align-items: center;
+        }
+        .uvd-q-status {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-family: ui-monospace, Consolas, monospace;
+            letter-spacing: 0.05em;
+        }
+        .uvd-q-name {
+            color: #ddd;
+            font-size: 12px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .uvd-q-actions { display: inline-flex; gap: 6px; }
+        .uvd-q-btn {
+            background: transparent;
+            color: #aaa;
+            border: 1px solid #444;
+            border-radius: 5px;
+            padding: 3px 9px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .uvd-q-btn:hover { background: #2a2a2a; color: #fff; }
+        .uvd-q-bar {
+            margin-top: 8px;
+            height: 4px;
+            background: #2a2a2a;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+        .uvd-q-fill {
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+        .uvd-q-meta {
+            color: #888;
+            font-size: 11px;
+            margin-top: 6px;
+            font-family: ui-monospace, Consolas, monospace;
+        }
     `);
 
     // ==================== UTILITIES ====================
@@ -1361,6 +1491,7 @@
                                 ${HELPER.alive ? 'helper running' : 'no helper'}
                             </span>
                         </button>
+                        <button class="uvd-gear-btn" id="uvd-view-queue" title="Open the queue panel" style="margin-right: 0;">📋 Queue</button>
                         <button class="uvd-btn uvd-btn-copy" id="uvd-copy-url">📋 Copy URL</button>
                         <button class="uvd-btn uvd-btn-secondary" id="uvd-copy-all">📦 Copy All URLs</button>
                         <button class="uvd-btn uvd-btn-primary" id="uvd-download-btn">⬇️ Download</button>
@@ -1415,6 +1546,10 @@
         overlay.querySelector('#uvd-settings').addEventListener('click', () => {
             openSettingsModal(overlay);
         });
+
+        // Queue panel
+        const qBtn = overlay.querySelector('#uvd-view-queue');
+        if (qBtn) qBtn.addEventListener('click', () => openQueuePanel(overlay));
 
         // Refresh helper badge whenever the dialog opens — the helper may
         // have come up since the last detection (e.g. user just ran the
@@ -1851,6 +1986,163 @@
         }
     }
 
+    // v2.6.0 — Queue toast + queue panel.
+    //
+    // Instead of replacing the dialog when the user clicks Download
+    // (which prevented batch queueing), we drop a transient toast at
+    // the bottom of the dialog, leave the streams list intact, and
+    // bump a "queue" badge near the Settings/helper status. The full
+    // progress UI is still available via the "View queue" button.
+    function showQueueToast(overlay, job, payload) {
+        const footer = overlay.querySelector('.uvd-footer') || overlay.querySelector('#uvd-dialog');
+        let toast = overlay.querySelector('#uvd-queue-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'uvd-queue-toast';
+            toast.className = 'uvd-queue-toast';
+            (footer || overlay).appendChild(toast);
+        }
+        const name = (payload && payload.filename) || (job && job.filename) || 'stream';
+        setHTML(toast, `✅ Queued <code>${escapeHtmlText(name)}</code>
+            <button class="uvd-toast-link" id="uvd-toast-view">View queue</button>`);
+        toast.classList.add('show');
+        // Re-bind the action button (setHTML replaces the inner DOM each time)
+        const viewBtn = toast.querySelector('#uvd-toast-view');
+        if (viewBtn) viewBtn.addEventListener('click', () => openQueuePanel(overlay));
+        clearTimeout(toast._hideTimer);
+        toast._hideTimer = setTimeout(() => toast.classList.remove('show'), 4000);
+    }
+
+    function escapeHtmlText(s) {
+        return String(s).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+
+    // Fetch a single /queue snapshot and update the helper badge with
+    // a "N queued · M running" suffix if there's any activity.
+    async function pollQueueOnce(overlay) {
+        try {
+            const q = await gmFetch('GET', '/queue');
+            const stats = (q && q.stats) || { byStatus: {} };
+            const queued = stats.byStatus?.queued || 0;
+            const running = stats.byStatus?.running || 0;
+            const badge = overlay.querySelector('#uvd-helper-badge');
+            if (badge) {
+                // We rebuild the badge's text the same way updateHelperBadge does.
+                const dot = badge.querySelector('.uvd-helper-badge-dot');
+                badge.textContent = '';
+                if (dot) badge.appendChild(dot);
+                let label = HELPER.alive ? 'helper running' : 'no helper';
+                if (queued + running > 0) label += ` · ${running}↓ / ${queued}🕓`;
+                badge.appendChild(document.createTextNode(' ' + label));
+            }
+        } catch (e) { /* badge stays as-is */ }
+    }
+
+    // Replaces the dialog body with the full queue panel. Polls
+    // every 800ms; one row per job with status, progress, controls.
+    function openQueuePanel(overlay) {
+        const dialog = overlay.querySelector('#uvd-dialog');
+        [...dialog.querySelectorAll('.uvd-content, .uvd-footer, .uvd-tabs, .uvd-progress-view, .uvd-queue-panel')].forEach(el => el.remove());
+
+        const panel = document.createElement('div');
+        panel.className = 'uvd-queue-panel';
+        setHTML(panel, `
+            <div class="uvd-queue-head">
+                <div>
+                    <h3 style="margin:0;color:#fff;">Queue</h3>
+                    <div class="uvd-queue-sub" id="uvd-queue-sub">—</div>
+                </div>
+                <div class="uvd-queue-head-actions">
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-q-back">← Streams</button>
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-q-pause">⏸ Pause queue</button>
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-q-clear">🧹 Clear done</button>
+                </div>
+            </div>
+            <div class="uvd-queue-list" id="uvd-q-list"></div>
+        `);
+        dialog.appendChild(panel);
+
+        panel.querySelector('#uvd-q-back').addEventListener('click', () => {
+            stopProgressPoll();
+            removeDialog();
+            setTimeout(showDialog, 100);
+        });
+        panel.querySelector('#uvd-q-pause').addEventListener('click', async (e) => {
+            const btn = e.currentTarget;
+            const willPause = !btn.dataset.paused;
+            try {
+                await gmFetch('POST', willPause ? '/queue/pause' : '/queue/resume', {});
+                btn.dataset.paused = willPause ? '1' : '';
+                btn.textContent = willPause ? '▶ Resume queue' : '⏸ Pause queue';
+            } catch (_) {}
+        });
+        panel.querySelector('#uvd-q-clear').addEventListener('click', async () => {
+            try { await gmFetch('POST', '/queue/clear-completed', {}); } catch (_) {}
+        });
+
+        const list = panel.querySelector('#uvd-q-list');
+        const sub = panel.querySelector('#uvd-queue-sub');
+
+        const fmt = (n) => {
+            if (!n) return '—';
+            if (n < 1024) return n + ' B';
+            if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+            if (n < 1073741824) return (n / 1048576).toFixed(2) + ' MB';
+            return (n / 1073741824).toFixed(2) + ' GB';
+        };
+
+        const refresh = async () => {
+            let q;
+            try { q = await gmFetch('GET', '/queue'); }
+            catch (e) { sub.textContent = 'Helper unreachable.'; return; }
+            const stats = q.stats || { byStatus: {} };
+            const bs = stats.byStatus || {};
+            sub.textContent = `${bs.running || 0} running · ${bs.queued || 0} queued · ${bs.done || 0} done · ${bs.error || 0} error`;
+            const jobs = (q.jobs || []).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            const rows = jobs.map(j => {
+                const statusColor = ({
+                    running: '#22c55e', queued: '#a8a29e',
+                    done: '#86efac', error: '#fca5a5', cancelled: '#94a3b8',
+                }[j.status] || '#a8a29e');
+                const pct = Math.max(0, Math.min(100, j.progress || 0));
+                const showBar = j.status === 'running' || j.status === 'done';
+                const sizeStr = j.bytesTotal ? `${fmt(j.bytesDownloaded)} / ${fmt(j.bytesTotal)}` : (j.bytesDownloaded ? fmt(j.bytesDownloaded) : '');
+                const meta = [j.speed, j.eta ? `ETA ${j.eta}` : '', sizeStr].filter(Boolean).join(' · ');
+                const retry = j.retryCount > 0 ? ` <span style="color:#fbbf24;">retry ${j.retryCount}</span>` : '';
+                return `<div class="uvd-q-row" data-id="${j.id}">
+                    <div class="uvd-q-row-top">
+                        <span class="uvd-q-status" style="color:${statusColor}">${j.status}${retry}</span>
+                        <span class="uvd-q-name" title="${escapeHtmlText(j.filename || '')}">${escapeHtmlText(j.filename || j.url || '(no name)')}</span>
+                        <span class="uvd-q-actions">
+                            ${j.status === 'queued' || j.status === 'running' ? `<button class="uvd-q-btn" data-act="cancel">Cancel</button>` : ''}
+                            ${j.status === 'error' || j.status === 'cancelled' ? `<button class="uvd-q-btn" data-act="retry">Retry</button>` : ''}
+                        </span>
+                    </div>
+                    ${showBar ? `<div class="uvd-q-bar"><div class="uvd-q-fill" style="width:${pct.toFixed(1)}%;background:${statusColor}"></div></div>` : ''}
+                    <div class="uvd-q-meta">${pct ? pct.toFixed(1) + '% · ' : ''}${meta}${j.error ? ` <span style="color:#fca5a5;">${escapeHtmlText(j.error.split('\n')[0])}</span>` : ''}</div>
+                </div>`;
+            }).join('');
+            setHTML(list, rows || '<div class="uvd-empty">Nothing in the queue yet.</div>');
+            list.querySelectorAll('.uvd-q-btn').forEach(b => {
+                b.addEventListener('click', async (e) => {
+                    const row = e.currentTarget.closest('.uvd-q-row');
+                    const jid = row && row.dataset.id;
+                    const act = e.currentTarget.dataset.act;
+                    if (!jid) return;
+                    try {
+                        await gmFetch('GET', `/jobs/${jid}/${act}`);
+                    } catch (_) {}
+                });
+            });
+        };
+
+        stopProgressPoll();
+        HELPER.activePoll = setInterval(refresh, 800);
+        refresh();
+    }
+
     // ==================== DOWNLOAD HANDLER ====================
     // Resolution order:
     //   1. Helper available + token set → POST /download, show progress UI.
@@ -1890,7 +2182,15 @@
                 payload.lang = (selectedItem.querySelector('.uvd-col-codec')?.textContent || 'en').trim() || 'en';
             }
             helperStartDownload(payload).then((job) => {
-                renderProgressView(overlay, job, payload);
+                // v2.6.0: don't replace the dialog with the progress
+                // view on every single click — that made it impossible
+                // to queue multiple streams in one sitting. Just show a
+                // brief toast at the bottom of the dialog and refresh
+                // the queue badge. The user can keep selecting and
+                // clicking Download to fill the queue. The full progress
+                // UI is one click away via the "Queue" button.
+                showQueueToast(overlay, job, payload);
+                pollQueueOnce(overlay);
             }, (err) => {
                 if (err && err.status === 401) {
                     alert('Helper rejected token. Click ⚙️ Settings and paste the token again.');

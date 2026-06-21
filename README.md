@@ -1,14 +1,61 @@
 # Universal Video Download
 
-A Tampermonkey userscript that brings **NewPipe-style** download options to **any website with video content**. Pick resolution, container, codec, audio track, subtitles and parallel-thread count from a clean dark dialog, then save the file locally.
+A Tampermonkey userscript + tiny localhost daemon that brings **NewPipe-style** downloads to **every site that plays video**, including YouTube's signature-encrypted streams. Pick resolution, container, codec, audio track, subtitles and parallel-thread count from a clean dark dialog. The Download button just works end-to-end — file lands on disk, progress bar lives in the dialog.
 
-**Two modes:**
+---
 
-- **Standalone** — direct downloads via the browser's download manager. Works on most sites out of the box. On YouTube, signature-encrypted streams get a one-click `yt-dlp` command copied to your clipboard.
-- **With helper** (`helper/install.ps1`) — a tiny localhost daemon runs `yt-dlp` for you. The Download button just works end-to-end on every site, YouTube included. Progress bar lives in the dialog. See [`helper/README.md`](./helper/README.md).
+## Quick start (do this in order)
 
-> Userscript: one file, vanilla JS, no build step.
-> Helper: one file, Python stdlib only.
+The userscript can't run `yt-dlp` on its own — the browser sandbox blocks process execution. The helper daemon is what closes the gap. **Install the helper first, then the userscript, then paste the token. The userscript will look broken on YouTube until all three steps are done.**
+
+### 1. Install and start the helper (~30 seconds)
+
+**Windows:**
+
+```powershell
+# Clone or download the repo, then from its root:
+.\helper\install.ps1
+```
+
+The installer ensures Python 3.10+, yt-dlp, and ffmpeg are installed (via winget), drops `uvd-helper.py` into `%LOCALAPPDATA%\uvd-helper\`, sets up auto-start at login via a Startup-folder `.vbs` launcher, runs the daemon now, prints a `/health` check, and **copies the access token to your clipboard**. Keep the clipboard untouched for step 3.
+
+**macOS / Linux:** no installer yet — run `python3 helper/uvd-helper.py` in a terminal (or wire it into launchctl/systemd) and grab the token from `~/Library/Application Support/uvd-helper/config.json` or `$XDG_CONFIG_HOME/uvd-helper/config.json`. See [`helper/README.md`](./helper/README.md) for the full helper docs.
+
+### 2. Install the userscript
+
+1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension.
+2. **Chromium 138+ (Chrome, Edge, Brave, Opera):** open `chrome://extensions` (or the equivalent for your browser), find the Tampermonkey card, and flip **"Allow User Scripts"** on. Without this, Tampermonkey will not execute userscripts at all.
+3. Open the raw script URL — Tampermonkey will offer to install it:
+   https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
+4. Reload any tab where you want it (e.g. youtube.com).
+
+### 3. Paste the token
+
+1. On any supported site, press **`Ctrl+Shift+D`** to open the dialog (or click the circular FAB bottom-right).
+2. Click **⚙️ Settings**.
+3. **Paste** (Ctrl+V — the installer put the token in your clipboard). Click **Test** to confirm, then **Save**.
+4. Done. The status badge in the footer now reads **"helper running"**.
+
+That's it. Click any stream → **Download** → progress bar appears → file lands at `~/Downloads/uvd/` (or wherever the helper's `config.json` `downloadDir` points).
+
+> If you skip step 1 the userscript still works on most non-YouTube sites via the browser's download manager. For YouTube without the helper you'll get a `yt-dlp` command copied to your clipboard that you have to paste into a terminal yourself. That's the v2.4 fallback path — functional but not what you want long-term.
+
+---
+
+## Repo layout
+
+```
+universal-video-download.user.js   ← the userscript itself (Tampermonkey)
+helper/
+  uvd-helper.py                    ← the daemon — Python stdlib only
+  install.ps1                      ← Windows installer (winget + Startup launcher + token)
+  README.md                        ← helper-specific docs (API, security, troubleshooting)
+README.md                          ← you are here
+BUGS.md                            ← every bug fixed, why, and how
+LICENSE
+```
+
+Both halves are deliberately small: one .js file, one .py file, plus a thin installer.
 
 ---
 
@@ -28,25 +75,7 @@ A Tampermonkey userscript that brings **NewPipe-style** download options to **an
 
 ---
 
-## Install
-
-1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension (Chrome, Edge, Firefox, Brave, Opera, Safari are all supported).
-2. Open the Tampermonkey dashboard and create a new userscript (or open the raw `.user.js` URL — Tampermonkey will offer to install it).
-3. Replace the placeholder content with the contents of [`universal-video-download.user.js`](./universal-video-download.user.js).
-4. Save with `Ctrl+S`.
-
-The script declares `@match *://*/*`, so it loads on every page. If you want to limit it, edit `@match` in the userscript header before saving.
-
-### Chromium 138+ (Chrome, Edge, Brave, Opera): enable "Allow User Scripts"
-
-Starting with Chromium 138, MV3 extensions can no longer inject userscripts by default. Open `chrome://extensions` (or `brave://extensions`, `edge://extensions`), find the Tampermonkey card, and either:
-
-- Flip **"Allow User Scripts"** on the Tampermonkey card, **or**
-- Toggle **"Developer mode"** in the top-right of the extensions page (same effect, applies globally).
-
-Without this, Tampermonkey will show a banner reading *"Please enable the `Allow User Scripts` extension setting"* on every page and userscripts will not execute.
-
-### Permissions used
+## Permissions used by the userscript
 
 | Grant | Why |
 | --- | --- |
