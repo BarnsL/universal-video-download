@@ -34,9 +34,11 @@ Then in your browser:
 1. Ensures Python 3.10+, `yt-dlp`, `ffmpeg` are installed (via winget).
 2. Drops `uvd-helper.py` into `%LOCALAPPDATA%\uvd-helper\`.
 3. Bootstraps `config.json` with a random 64-hex-char token.
-4. Registers a Scheduled Task that auto-starts the helper at login,
-   hidden, with no console window (uses `pythonw.exe` when present).
-5. Starts the task now.
+4. Drops a tiny `.vbs` launcher into the Windows Startup folder so the
+   helper auto-starts on login (silent, no console flash, uses
+   `pythonw.exe` when present). Removes any legacy Scheduled Task
+   left from earlier installer versions.
+5. Starts the helper now if nothing is already listening on the port.
 6. Probes `/health` to confirm the helper is up.
 7. Copies the token to your clipboard.
 
@@ -131,8 +133,11 @@ Common failures:
 ## Uninstall
 
 ```powershell
-Unregister-ScheduledTask -TaskName uvd-helper -Confirm:$false
+Stop-Process -Name pythonw -ErrorAction SilentlyContinue
+Remove-Item "$([Environment]::GetFolderPath('Startup'))\uvd-helper.vbs" -ErrorAction SilentlyContinue
 Remove-Item -Recurse "$env:LOCALAPPDATA\uvd-helper"
+# Also remove a Scheduled Task if you installed an earlier helper version:
+Unregister-ScheduledTask -TaskName uvd-helper -Confirm:$false -ErrorAction SilentlyContinue
 ```
 
 ## Non-Windows
