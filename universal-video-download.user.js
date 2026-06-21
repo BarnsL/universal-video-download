@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.5.1
+// @version      2.5.2
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -2005,9 +2005,12 @@
             return;
         }
 
-        // On YouTube, always show on /watch pages
+        // On YouTube, always show on /watch pages, and keep trying to
+        // inject the inline button until it sticks (YouTube's action-
+        // bar DOM isn't always present at first load).
         if (CONFIG.supportedSites.youtube.test(location.hostname) && location.pathname === '/watch') {
             showFab();
+            if (!document.getElementById('uvd-yt-btn')) injectYouTubeButton();
             return;
         }
 
@@ -2016,14 +2019,44 @@
         }
     }
 
-    // Also inject an inline button on YouTube
+    // Also inject an inline button on YouTube. YouTube renames their
+    // action-bar container roughly every few months; we walk a list of
+    // known selectors (newest first) and fall back to "next to the Like
+    // button" if none of them match. If even that fails we just leave
+    // the FAB as the only entry point — the script still works.
     function injectYouTubeButton() {
         if (!CONFIG.supportedSites.youtube.test(location.hostname)) return;
         if (document.getElementById('uvd-yt-btn')) return;
 
-        const container = document.querySelector('#top-level-buttons-computed') ||
-                         document.querySelector('ytd-menu-renderer #top-level-buttons-computed');
-        if (!container) return;
+        const selectors = [
+            // 2026 layout (current)
+            'ytd-watch-metadata #actions-inner #menu ytd-menu-renderer #top-level-buttons-computed',
+            'ytd-watch-metadata #actions #menu ytd-menu-renderer #top-level-buttons-computed',
+            'ytd-watch-metadata #menu ytd-menu-renderer #top-level-buttons-computed',
+            // older
+            '#top-level-buttons-computed',
+            'ytd-menu-renderer #top-level-buttons-computed',
+            // generic action-bar fallbacks
+            'ytd-watch-metadata #actions-inner',
+            'ytd-watch-metadata #actions',
+            '#actions-inner',
+            '#actions',
+        ];
+        let container = null;
+        for (const sel of selectors) {
+            container = document.querySelector(sel);
+            if (container) break;
+        }
+        // Last resort: find the Like button's parent (its row almost
+        // always hosts the inline action buttons).
+        if (!container) {
+            const like = document.querySelector('like-button-view-model, ytd-toggle-button-renderer, button[aria-label*="like" i]');
+            if (like) container = like.parentElement;
+        }
+        if (!container) {
+            console.warn('[UVD] could not find a YouTube action-bar container to inject Download button into; using FAB only.');
+            return;
+        }
 
         const btn = document.createElement('button');
         btn.id = 'uvd-yt-btn';
@@ -2034,6 +2067,7 @@
             border-radius: 18px; font-size: 14px; font-weight: 500;
             cursor: pointer; font-family: 'Roboto', sans-serif;
             transition: background 0.2s;
+            vertical-align: middle;
         `;
         // Trusted Types wrapper — see top of file (BUG-003 fix).
         setHTML(btn, `<svg style="width:16px;height:16px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> Download`);
@@ -2089,7 +2123,27 @@
     }
 
     // ==================== INITIALIZATION ====================
-    createFab();
+    try {
+        createFab();
+        // Show the FAB immediately on supported sites — historically we
+        // waited 2s for scanForMedia() to add the .visible class. That
+        // made it look like "nothing happened" after install on YouTube.
+        // On supported sites we already know the FAB should be visible.
+        if (CONFIG.supportedSites.youtube.test(location.hostname)
+            || CONFIG.supportedSites.vimeo.test(location.hostname)
+            || CONFIG.supportedSites.twitter.test(location.hostname)
+            || CONFIG.supportedSites.tiktok.test(location.hostname)
+            || CONFIG.supportedSites.reddit.test(location.hostname)
+            || CONFIG.supportedSites.twitch.test(location.hostname)
+            || CONFIG.supportedSites.facebook.test(location.hostname)
+            || CONFIG.supportedSites.instagram.test(location.hostname)
+            || CONFIG.supportedSites.dailymotion.test(location.hostname)) {
+            showFab();
+        }
+        console.info('[UVD] FAB created and visible. v2.5.2');
+    } catch (e) {
+        console.error('[UVD] createFab failed (likely a CSP/Trusted Types issue):', e);
+    }
 
     // Probe the helper once at startup. Cheap (single GET to localhost
     // with a short timeout), and lets us color the FAB dot before the
