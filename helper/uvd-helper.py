@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 
 _real_print = print  # capture before any further indirection
@@ -456,6 +456,11 @@ def run_job(job: Job) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 (default is 1.0) — modern clients (browser fetch,
+    # GM_xmlhttpRequest) speak 1.1 and can get confused when an HTTP/1.0
+    # response closes the connection mid-keepalive. Sending HTTP/1.1
+    # responses with our explicit Content-Length fixes that.
+    protocol_version = "HTTP/1.1"
     server_version = f"uvd-helper/{VERSION}"
     sys_version = ""
 
@@ -489,15 +494,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, body: dict) -> None:
         data = json.dumps(body).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        for k, v in self._cors_headers().items():
-            self.send_header(k, v)
-        self.end_headers()
+        # Wrap the entire send. On Windows, clients that close the
+        # socket mid-response surface as ConnectionAbortedError
+        # (WinError 10053) — distinct from BrokenPipeError on POSIX and
+        # from ConnectionResetError. Treat all three as "client gave up,
+        # nothing more to do" so the handler thread doesn't crash. The
+        # bare `OSError` catch covers any other socket-level oddity
+        # (timeout, connection reset by router, etc.).
         try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            for k, v in self._cors_headers().items():
+                self.send_header(k, v)
+            self.end_headers()
             self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except OSError:
             pass
 
     def _check_auth(self) -> bool:
@@ -517,11 +532,16 @@ class Handler(BaseHTTPRequestHandler):
     # --- routing ----------------------------------------------------------
 
     def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(204)
-        for k, v in self._cors_headers().items():
-            self.send_header(k, v)
-        self.send_header("Access-Control-Max-Age", "86400")
-        self.end_headers()
+        try:
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            for k, v in self._cors_headers().items():
+                self.send_header(k, v)
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
