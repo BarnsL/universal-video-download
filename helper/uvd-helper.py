@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "1.0.3"
+VERSION = "1.0.5"
 
 
 _real_print = print  # capture before any further indirection
@@ -290,6 +290,34 @@ CONFIG = load_or_init_config()
 DOWNLOAD_DIR = Path(CONFIG["downloadDir"])
 
 
+def _probe_tools_once() -> dict:
+    """One-time probe of yt-dlp + ffmpeg --version. Results are baked
+    into the module-level cache that /health reads. We don't re-probe at
+    runtime because (a) the tools don't appear or disappear mid-session
+    in any normal flow, (b) each subprocess.run takes 2-3s on Windows
+    just for Python startup, and probing per /health blew past the
+    userscript's 2.5s timeout and made the helper look dead."""
+    out: dict[str, str | None] = {"yt-dlp": None, "ffmpeg": None}
+    creationflags = (
+        subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # type: ignore[attr-defined]
+    )
+    for tool in out:
+        try:
+            r = subprocess.run(
+                [tool, "--version"],
+                capture_output=True, text=True, timeout=4,
+                creationflags=creationflags,
+            )
+            if r.returncode == 0:
+                out[tool] = r.stdout.strip().splitlines()[0] if r.stdout else "ok"
+        except Exception:
+            pass
+    return out
+
+
+_tools_cache = _probe_tools_once()
+
+
 def ensure_dir(p: Path) -> None:
     """mkdir(parents=True, exist_ok=True), but tolerant of junctions /
     reparse points on Windows. Some user home folders (Downloads, Documents
@@ -456,11 +484,17 @@ def run_job(job: Job) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    # HTTP/1.1 (default is 1.0) — modern clients (browser fetch,
-    # GM_xmlhttpRequest) speak 1.1 and can get confused when an HTTP/1.0
-    # response closes the connection mid-keepalive. Sending HTTP/1.1
-    # responses with our explicit Content-Length fixes that.
-    protocol_version = "HTTP/1.1"
+    # Stay on HTTP/1.0 (the stdlib default). We tried protocol_version
+    # = "HTTP/1.1" in v1.0.3 — Python's BaseHTTPRequestHandler with
+    # HTTP/1.1 keeps the handler thread alive waiting for more
+    # requests on the same socket. Combined with ThreadingHTTPServer
+    # that means short-lived clients (browser XHR, curl one-shots)
+    # tie up worker threads waiting for a follow-up that never
+    # comes; eventually accept() can't keep up and new clients sit
+    # in the listen backlog without ever being served. HTTP/1.0
+    # means one request -> one response -> close, which is exactly
+    # what this daemon needs. Browsers downgrade to 1.0 silently
+    # and small fetch/XHR payloads work fine.
     server_version = f"uvd-helper/{VERSION}"
     sys_version = ""
 
@@ -646,22 +680,11 @@ class Handler(BaseHTTPRequestHandler):
     # --- introspection ----------------------------------------------------
 
     def _probe_tools(self) -> dict:
-        out: dict[str, str | None] = {"yt-dlp": None, "ffmpeg": None}
-        creationflags = (
-            subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # type: ignore[attr-defined]
-        )
-        for tool in out:
-            try:
-                r = subprocess.run(
-                    [tool, "--version"],
-                    capture_output=True, text=True, timeout=4,
-                    creationflags=creationflags,
-                )
-                if r.returncode == 0:
-                    out[tool] = r.stdout.strip().splitlines()[0] if r.stdout else "ok"
-            except Exception:
-                pass
-        return out
+        # Probe is expensive (subprocess startup) and the answer doesn't
+        # change inside a single helper run, so cache it at module
+        # level. /health hits this per request and was taking ~6s
+        # before the cache, blowing past the userscript's 2.5s timeout.
+        return _tools_cache
 
 
 def main() -> int:
