@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.8.2
+// @version      2.8.3
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -204,10 +204,18 @@
     // title-attributed link, then any anchor whose own href matches
     // -episode-(N+1)-.
     function findNextEpisodeLink() {
+        const el = findNextEpisodeAnchorElement();
+        return el ? (el.href || el.getAttribute('href')) : null;
+    }
+
+    // Same matching as findNextEpisodeLink but returns the DOM element
+    // itself so the button injector can park UVD's button right next
+    // to / under the site's existing episode-navigation button.
+    function findNextEpisodeAnchorElement() {
         const explicit = document.querySelector(
             'a[title*="Next" i][title*="Episode" i], a[title="Play Next Episode"]'
         );
-        if (explicit && explicit.href) return explicit.href;
+        if (explicit && (explicit.href || explicit.getAttribute('href'))) return explicit;
 
         const ctx = detectEpisodeContext();
         if (!ctx) return null;
@@ -215,7 +223,7 @@
         const candidates = Array.from(document.querySelectorAll('a[href]'));
         for (const a of candidates) {
             const m = (a.getAttribute('href') || a.href || '').match(EPISODE_RE);
-            if (m && parseInt(m[1], 10) === wantN) return a.href;
+            if (m && parseInt(m[1], 10) === wantN) return a;
         }
         return null;
     }
@@ -2764,6 +2772,21 @@
         if (CONFIG.supportedSites.atoz.test(location.hostname)) return;
         if (document.getElementById('uvd-site-btn')) return;
 
+        // v2.8.3 — on episode pages, prefer the site's existing
+        // "next episode" link as the anchor. The button stacks directly
+        // under it instead of being centered across the page width,
+        // which on sites like wcoanimedub.tv puts the UVD button under
+        // the right-side "Episode N+1" navigation pill rather than
+        // floating across the middle of the page.
+        if (detectEpisodeContext()) {
+            const nextEpAnchor = findNextEpisodeAnchorElement();
+            if (nextEpAnchor) {
+                placeUvdButtonAfter(nextEpAnchor, 'Download via UVD', { align: 'inherit' });
+                hideFab();
+                return;
+            }
+        }
+
         // Skip elements that are inside our own dialog/FAB so we don't
         // attach the button to itself.
         const skipInside = (el) => {
@@ -2900,7 +2923,10 @@
         return wrappers.length ? wrappers[0].el : null;
     }
 
-    function placeUvdButtonAfter(anchor, label) {
+    function placeUvdButtonAfter(anchor, label, opts) {
+        opts = opts || {};
+        const align = opts.align || 'center';  // 'center' | 'inherit'
+
         const btn = document.createElement('button');
         btn.id = 'uvd-site-btn';
         btn.title = 'Universal Video Download — open the streams dialog (Ctrl+Shift+D)';
@@ -2919,13 +2945,36 @@
 
         const parent = anchor.parentElement;
         if (!parent) return;
-        const wrap = document.createElement('div');
-        wrap.style.cssText = 'display:block;margin:10px 0 8px 0;text-align:center;width:100%;';
-        wrap.appendChild(btn);
-        if (anchor.nextSibling) {
-            parent.insertBefore(wrap, anchor.nextSibling);
+
+        if (align === 'inherit') {
+            // v2.8.3 — sibling-mode placement. Read the parent's
+            // computed text-align so the UVD button stacks directly
+            // under whatever side the anchor sits on (typically right
+            // on episode pages — wcoanimedub puts the next-episode
+            // pill in a right-aligned <td>). Without this match the
+            // button would left-align under a right-aligned link,
+            // breaking the visual association the user asked for.
+            let parentTA = 'inherit';
+            try {
+                parentTA = getComputedStyle(parent).textAlign || 'inherit';
+            } catch (_) {}
+            const wrap = document.createElement('div');
+            wrap.style.cssText = `display:block;margin:8px 0 0 0;text-align:${parentTA};`;
+            wrap.appendChild(btn);
+            if (anchor.nextSibling) {
+                parent.insertBefore(wrap, anchor.nextSibling);
+            } else {
+                parent.appendChild(wrap);
+            }
         } else {
-            parent.appendChild(wrap);
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'display:block;margin:10px 0 8px 0;text-align:center;width:100%;';
+            wrap.appendChild(btn);
+            if (anchor.nextSibling) {
+                parent.insertBefore(wrap, anchor.nextSibling);
+            } else {
+                parent.appendChild(wrap);
+            }
         }
     }
 
