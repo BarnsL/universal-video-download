@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @match        *://*/*
@@ -16,6 +16,42 @@
 
 (function() {
     'use strict';
+
+    // ==================== TRUSTED TYPES (BUG-003 fix) ====================
+    // YouTube (and a growing list of Google properties, GitHub, etc.) send
+    //   Content-Security-Policy: require-trusted-types-for 'script'
+    // which makes ANY raw `el.innerHTML = "..."` throw at runtime:
+    //   "This document requires 'TrustedHTML' assignment. The action has been blocked."
+    // Because our very first DOM write is in createFab() during init, an
+    // unhandled throw there halts the whole script — no FAB, no YouTube
+    // button, no Ctrl+Shift+D dialog, nothing.
+    //
+    // Fix: declare a passthrough Trusted Types policy once at boot and route
+    // every innerHTML write through setHTML(). The policy name must be unique
+    // per document; we use "uvd-policy". On browsers without Trusted Types
+    // (Firefox today, older Chromium) trustedTypes is undefined and we fall
+    // back to raw assignment, which is harmless because the CSP isn't there.
+    //
+    // Why a passthrough is safe here: every HTML string we feed setHTML() is
+    // a static template literal authored in this file. We never interpolate
+    // attacker-controlled data into innerHTML. If that ever changes, swap
+    // createHTML to sanitize.
+    let uvdTrustedHTML = null;
+    if (typeof window !== 'undefined' && window.trustedTypes && window.trustedTypes.createPolicy) {
+        try {
+            uvdTrustedHTML = window.trustedTypes.createPolicy('uvd-policy', {
+                createHTML: (s) => s
+            });
+        } catch (e) {
+            // Policy name already claimed on this document, or page CSP
+            // forbids creating new policies. Leave uvdTrustedHTML null and
+            // let setHTML() try raw assignment — it will throw and the
+            // failure will be visible in the console rather than silent.
+        }
+    }
+    function setHTML(el, html) {
+        el.innerHTML = uvdTrustedHTML ? uvdTrustedHTML.createHTML(html) : html;
+    }
 
     // ==================== CONFIGURATION ====================
     const CONFIG = {
@@ -1000,7 +1036,9 @@
 
         const overlay = document.createElement('div');
         overlay.id = 'uvd-overlay';
-        overlay.innerHTML = `
+        // setHTML() wraps the template through the Trusted Types policy so
+        // YouTube's require-trusted-types-for CSP doesn't block this write.
+        setHTML(overlay, `
             <div id="uvd-dialog">
                 <div class="uvd-header">
                     <h2 title="${streams.title}">⬇️ ${streams.title}</h2>
@@ -1055,7 +1093,7 @@
                     </div>
                 </div>
             </div>
-        `;
+        `);
 
         document.body.appendChild(overlay);
         requestAnimationFrame(() => overlay.classList.add('visible'));
@@ -1267,7 +1305,8 @@
         // See BUGS.md for full details.
         const overlay = document.createElement('div');
         overlay.id = 'uvd-overlay';
-        overlay.innerHTML = `
+        // Trusted Types wrapper — see top of file (BUG-003 fix).
+        setHTML(overlay, `
             <div id="uvd-dialog">
                 <div class="uvd-header">
                     <h2>⬇️ No Streams Detected</h2>
@@ -1296,7 +1335,7 @@
                     </div>
                 </div>
             </div>
-        `;
+        `);
         document.body.appendChild(overlay);
         requestAnimationFrame(() => overlay.classList.add('visible'));
 
@@ -1357,10 +1396,12 @@
         const fab = document.createElement('button');
         fab.id = 'uvd-fab';
         fab.title = 'Download Video';
-        fab.innerHTML = `
+        // Trusted Types wrapper — see top of file (BUG-003 fix). Without this,
+        // YouTube's CSP throws here and the entire init halts.
+        setHTML(fab, `
             <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
             <span class="uvd-badge" style="display:none;">0</span>
-        `;
+        `);
         fab.addEventListener('click', showDialog);
         document.body.appendChild(fab);
     }
@@ -1441,7 +1482,8 @@
             cursor: pointer; font-family: 'Roboto', sans-serif;
             transition: background 0.2s;
         `;
-        btn.innerHTML = `<svg style="width:16px;height:16px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> Download`;
+        // Trusted Types wrapper — see top of file (BUG-003 fix).
+        setHTML(btn, `<svg style="width:16px;height:16px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> Download`);
         btn.addEventListener('mouseover', () => btn.style.background = '#0051b5');
         btn.addEventListener('mouseout', () => btn.style.background = '#065fd4');
         btn.addEventListener('click', showDialog);

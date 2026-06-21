@@ -25,11 +25,20 @@ A single-file Tampermonkey userscript that brings **NewPipe-style** download opt
 ## Install
 
 1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension (Chrome, Edge, Firefox, Brave, Opera, Safari are all supported).
-2. Open the Tampermonkey dashboard and create a new userscript.
+2. Open the Tampermonkey dashboard and create a new userscript (or open the raw `.user.js` URL — Tampermonkey will offer to install it).
 3. Replace the placeholder content with the contents of [`universal-video-download.user.js`](./universal-video-download.user.js).
 4. Save with `Ctrl+S`.
 
 The script declares `@match *://*/*`, so it loads on every page. If you want to limit it, edit `@match` in the userscript header before saving.
+
+### Chromium 138+ (Chrome, Edge, Brave, Opera): enable "Allow User Scripts"
+
+Starting with Chromium 138, MV3 extensions can no longer inject userscripts by default. Open `chrome://extensions` (or `brave://extensions`, `edge://extensions`), find the Tampermonkey card, and either:
+
+- Flip **"Allow User Scripts"** on the Tampermonkey card, **or**
+- Toggle **"Developer mode"** in the top-right of the extensions page (same effect, applies globally).
+
+Without this, Tampermonkey will show a banner reading *"Please enable the `Allow User Scripts` extension setting"* on every page and userscripts will not execute.
 
 ### Permissions used
 
