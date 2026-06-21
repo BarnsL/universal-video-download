@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.7.1
+// @version      2.7.2
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -2400,80 +2400,143 @@
     //
     // We also avoid double-injection on YouTube (which has its own
     // injector) and on the AtoZ flow.
+    //
+    // v2.7.2 — match broader labels ("Download Episode", "Download MP4"),
+    // aria-labels / titles, AND fall back to "right under the video
+    // iframe" on sites that have no Download button at all (wcoanimedub
+    // → embed.wcostream.com, plenty of similar mirror sites).
     function injectGenericSiteButton() {
         if (CONFIG.supportedSites.youtube.test(location.hostname)) return;
         if (CONFIG.supportedSites.atoz.test(location.hostname)) return;
         if (document.getElementById('uvd-site-btn')) return;
 
-        // Find candidates: clickable elements whose direct text content
-        // (trimmed) is exactly "Download" — case-insensitive. We avoid
-        // matching long labels like "Free Download" or "Download App"
-        // so we don't shove the button next to a marketing CTA. We
-        // also skip elements that are inside our own dialog.
-        const TEXT_RE = /^download$/i;
+        // Skip elements that are inside our own dialog/FAB so we don't
+        // attach the button to itself.
         const skipInside = (el) => {
             for (let n = el; n; n = n.parentElement) {
-                if (n.id === 'uvd-overlay' || n.id === 'uvd-fab') return true;
+                if (n.id === 'uvd-overlay' || n.id === 'uvd-fab' || n.id === 'uvd-site-btn') return true;
             }
             return false;
         };
-        const candidates = Array.from(
-            document.querySelectorAll('button, a, [role="button"]')
-        ).filter(el => {
-            if (skipInside(el)) return false;
-            // Direct (own) text only — descendant text noise is too noisy.
+
+        // Match priority (best -> worst):
+        //   1. own text is exactly "Download" — high confidence
+        //   2. own text starts with "Download " (e.g. "Download Episode")
+        //   3. aria-label / title contains the word "download"
+        //   4. has a child element with class/id containing "download"
+        //      (icon-only buttons, font-awesome download glyphs, etc.)
+        const EXACT_RE = /^download$/i;
+        const STARTS_RE = /^download[\s:_-]/i;
+        const HAS_RE = /\bdownload\b/i;
+        const ICONISH_RE = /(?:^|[\s.-])(?:fa-download|icon-download|download-icon|btn-download|download-btn)(?:$|[\s.-])/i;
+
+        const all = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+            .filter(el => !skipInside(el));
+        const matched = [];
+        for (const el of all) {
             const own = Array.from(el.childNodes)
                 .filter(n => n.nodeType === Node.TEXT_NODE)
                 .map(n => n.nodeValue.trim())
                 .join(' ').trim();
             const aria = (el.getAttribute('aria-label') || '').trim();
             const title = (el.getAttribute('title') || '').trim();
-            return TEXT_RE.test(own) || TEXT_RE.test(aria) || TEXT_RE.test(title);
-        });
-        if (!candidates.length) return;
+            const cls = (el.className || '').toString() + ' ' + (el.id || '');
+            const innerCls = Array.from(el.querySelectorAll('[class],[id]'))
+                .map(c => (c.className || '') + ' ' + (c.id || '')).join(' ');
 
-        // Pick the most user-visible one (largest bounding rect).
-        const target = candidates
-            .map(el => ({ el, rect: el.getBoundingClientRect() }))
-            .filter(x => x.rect.width > 20 && x.rect.height > 14)
-            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+            let score = 0;
+            if (EXACT_RE.test(own)) score = 100;
+            else if (STARTS_RE.test(own)) score = 80;
+            else if (HAS_RE.test(aria) || HAS_RE.test(title)) score = 60;
+            else if (ICONISH_RE.test(cls) || ICONISH_RE.test(innerCls)) score = 40;
+            if (score > 0) matched.push({ el, score });
+        }
+
+        // No native download button -> fall through to iframe-anchor mode.
+        if (!matched.length) {
+            const iframeAnchor = findVideoIframeAnchor();
+            if (iframeAnchor) {
+                placeUvdButtonAfter(iframeAnchor, 'Download via UVD');
+                hideFab();
+            }
+            return;
+        }
+
+        // Highest score first; among equals, largest visible bounding rect.
+        const target = matched
+            .map(x => {
+                const r = x.el.getBoundingClientRect();
+                return { el: x.el, score: x.score, area: r.width * r.height, w: r.width, h: r.height };
+            })
+            .filter(x => x.w > 20 && x.h > 14)
+            .sort((a, b) => (b.score - a.score) || (b.area - a.area))[0];
         if (!target) return;
 
+        placeUvdButtonAfter(target.el, 'Download via UVD');
+        hideFab();
+    }
+
+    // Anchor finder for sites that don't have any download button at
+    // all. We look for a video iframe whose src points at a known
+    // embed/player host pattern and return the iframe element. If
+    // there's no iframe but there's a <video> element with a usable
+    // bounding box (height > 200px), use that instead.
+    function findVideoIframeAnchor() {
+        const KNOWN_EMBED_RE = /(?:^|\.)(?:wcostream|wcofun|embed\.|mp4upload|streamtape|doodstream|dood\.|vidstreaming|vidstream|vidsrc|vidcdn|megacloud|megaplay|filemoon|mixdrop|streamhg|streamhide|vidoza|vidlox|sbplay|sbembed|hydrax|kwik\.|kwik|emturbovid|fembed|stape\.fun|abyss\.to|playerwish|swiftplayers|streamwish)/i;
+        const EMBED_PATH_RE = /\/(?:embed|e|player|video|play|stream)\b/i;
+
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        const ranked = iframes.map(f => {
+            const src = (f.getAttribute('src') || f.src || '').toString();
+            const r = f.getBoundingClientRect();
+            let score = 0;
+            try {
+                const u = new URL(src, location.href);
+                if (KNOWN_EMBED_RE.test(u.hostname)) score += 60;
+                if (EMBED_PATH_RE.test(u.pathname)) score += 20;
+            } catch (_) {}
+            // Iframes large enough to plausibly be a player
+            if (r.width > 320 && r.height > 200) score += 30;
+            return { el: f, score, area: r.width * r.height };
+        }).filter(x => x.score >= 30)
+          .sort((a, b) => (b.score - a.score) || (b.area - a.area));
+        if (ranked.length) return ranked[0].el;
+
+        const videos = Array.from(document.querySelectorAll('video'));
+        const vid = videos
+            .map(v => ({ el: v, r: v.getBoundingClientRect() }))
+            .filter(x => x.r.height > 200 && x.r.width > 320)
+            .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height))[0];
+        return vid ? vid.el : null;
+    }
+
+    function placeUvdButtonAfter(anchor, label) {
         const btn = document.createElement('button');
         btn.id = 'uvd-site-btn';
-        btn.title = 'Universal Video Download — try yt-dlp on this page or open the streams dialog';
+        btn.title = 'Universal Video Download — open the streams dialog (Ctrl+Shift+D)';
         btn.style.cssText = `
             display: inline-flex; align-items: center; gap: 6px;
-            margin: 8px 0 0 0;
-            padding: 8px 14px;
+            margin: 0;
+            padding: 9px 16px;
             background: linear-gradient(135deg, #065fd4, #3ea6ff);
             color: #fff; border: none; border-radius: 8px;
             font-size: 13px; font-weight: 500; cursor: pointer;
             box-shadow: 0 2px 8px rgba(6,95,212,0.3);
             font-family: inherit;
         `;
-        setHTML(btn, `<svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> Download via UVD`);
+        setHTML(btn, `<svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> ${label}`);
         btn.addEventListener('click', () => showDialog());
 
-        // Place directly after the site's download button, in a
-        // block-level wrapper so we appear underneath rather than
-        // beside, and centered horizontally inside that wrapper.
-        const parent = target.el.parentElement;
+        const parent = anchor.parentElement;
         if (!parent) return;
         const wrap = document.createElement('div');
-        wrap.style.cssText = 'display:block;margin:8px 0 0 0;text-align:center;width:100%;';
+        wrap.style.cssText = 'display:block;margin:10px 0 8px 0;text-align:center;width:100%;';
         wrap.appendChild(btn);
-        if (target.el.nextSibling) {
-            parent.insertBefore(wrap, target.el.nextSibling);
+        if (anchor.nextSibling) {
+            parent.insertBefore(wrap, anchor.nextSibling);
         } else {
             parent.appendChild(wrap);
         }
-
-        // v2.7.1 — once we've successfully injected the inline
-        // companion, the FAB is redundant. Drop it so it doesn't sit
-        // on top of the video controls (animepahe / Kwik / generic
-        // players all have controls at the bottom-right).
-        hideFab();
     }
 
     // Also inject an inline button on YouTube. YouTube renames their
