@@ -225,6 +225,67 @@ Instead of dead-ending with a useless alert when `url` is empty, the script now 
 
 ---
 
+## BUG-005: Userscript can't actually save signature-encrypted YouTube streams without the user opening a terminal
+
+**Reported:** 2026-06-21
+**Resolved:** 2026-06-21 (v2.5 + `helper/uvd-helper.py`)
+**Status:** RESOLVED via native helper
+**Severity:** UX (works in v2.4 via clipboard handoff, but every YouTube download needs a paste + run cycle)
+**Affected function:** `performDownload()` (userscript), entire helper daemon
+
+### Symptom
+v2.4 made YouTube cipher-protected downloads possible by copying a `yt-dlp` command to the clipboard. The user still has to (a) switch to a terminal, (b) paste, (c) press Enter. Workable, but not what a user clicking "Download" expects.
+
+### Resolution
+Ship a tiny Python daemon (`helper/uvd-helper.py`) that runs alongside the browser and exposes a localhost HTTP API. The userscript POSTs the download request to it; the daemon spawns `yt-dlp`; the userscript polls a job endpoint and draws a progress bar in the existing dialog.
+
+**Userscript changes (v2.5):**
+- Helper-bridge module added at the top of the IIFE: token storage via `GM_setValue`/`GM_getValue`, `gmFetch()` wrapper around `GM_xmlhttpRequest` (Tampermonkey's cross-origin-capable fetch), `detectHelper()` ping on init.
+- FAB grows a small status dot — green when helper reachable, slate otherwise.
+- New ⚙️ Settings button in the dialog footer opens a panel where the user pastes the token. A "Test" button hits `/jobs` to verify auth.
+- `performDownload()` resolution order: helper → direct URL → clipboard `yt-dlp` command → useful error. The cipher-encrypted YouTube path that previously fell through to the clipboard now goes through the helper if it's running, with the watch URL + itag sent as the payload.
+- New progress overlay (`renderProgressView`): bar, percentage, downloaded/total bytes, speed, ETA, status. Cancel button SIGTERMs the spawned `yt-dlp`. "Open folder" calls `POST /open-download-dir`. Log toggle shows the tail of `yt-dlp` stdout.
+- Polling at 800ms via `setInterval`; cleaned up on dialog close to avoid orphan requests.
+
+**Helper design:**
+- Stdlib only (`http.server.ThreadingHTTPServer`, `subprocess.Popen`, `secrets.token_hex`). Single file, ~300 lines.
+- Binds 127.0.0.1 only.
+- 64-hex-char token, generated on first run, stored in `config.json` (mode 0600 on POSIX). Required on every authed request, compared with `secrets.compare_digest`.
+- Origin whitelist mirrors the userscript's `@match` list. Browsers always send Origin on cross-origin POST, so an attacker page can't trigger downloads even with the token.
+- Bounded I/O (16 KB request cap, ~400 log lines per job, 50 jobs kept).
+- `yt-dlp` invoked via list argv — no shell, no injection surface.
+- URL scheme guard rejects anything that isn't `http(s)://`.
+- `--print-token` / `--print-config` one-shot modes for the installer.
+
+**Setup story (`helper/install.ps1`):**
+- Installs Python 3.12, yt-dlp, ffmpeg via winget if missing.
+- Drops `uvd-helper.py` into `%LOCALAPPDATA%\uvd-helper\`.
+- Bootstraps `config.json` using `python uvd-helper.py --print-config`.
+- Registers a hidden Scheduled Task that auto-starts the helper at user login via `pythonw.exe` (no console flash).
+- Probes `/health`, copies the token to the clipboard, prints next steps.
+- Idempotent: re-running the installer just re-creates the task and reuses the existing token/config.
+
+### Why a localhost helper instead of a native messaging host?
+
+Native messaging requires registering a manifest with Chrome/Brave's registry keys per-browser and per-user. The browser launches the helper on demand and pipes stdin/stdout. It's more "correct" than a localhost HTTP server, but:
+
+1. Registry-based registration breaks every time the user switches browsers or browser-channel (stable → beta).
+2. The Tampermonkey extension can't route messages to a native host; it would have to be a custom extension. That would mean shipping a Chrome Web Store extension on top of the userscript.
+3. localhost HTTP + a per-user token + Origin checks is the same model many real-world tools use (Spotify, Discord's local RPC, GitHub Desktop's auth bridge) and works across every browser without per-browser setup.
+
+### Security trade-offs worth knowing
+
+- Any process running as the same user can read `config.json` and use the token (on POSIX we set 0600; Windows ACLs already restrict the directory to the user). This matches the threat model of a download tool — if an attacker is running code as you, the helper isn't the weakest link.
+- A malicious page that satisfies the Origin whitelist AND learns the token could trigger downloads on the user's behalf. Mitigations: token isn't exposed anywhere in the page DOM (lives in Tampermonkey's GM storage); the whitelist is intentionally narrow (the specific streaming sites we support, plus `localhost`).
+- The helper does not (and will never) accept arbitrary commands. The only thing it can run is `yt-dlp` with a fixed argv shape. Adding flags requires editing `build_ytdlp_argv()`.
+
+### Notes for future maintainers
+- If you add a site to the userscript's `CONFIG.supportedSites`, also add a regex branch to `ALLOWED_ORIGIN_RE` in `uvd-helper.py`. The browser will refuse to send the request otherwise.
+- To debug: stop the scheduled task and run `python uvd-helper.py` in a terminal — the helper is silent by design but interactive runs surface tracebacks.
+- The progress regex assumes yt-dlp's `--newline` output format; if upstream changes it, update `PROGRESS_RE` in `uvd-helper.py`.
+
+---
+
 ## Notes
 
 - Both bugs are in the single file `universal-video-download.user.js`

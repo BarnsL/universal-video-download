@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -53,6 +53,98 @@
     }
     function setHTML(el, html) {
         el.innerHTML = uvdTrustedHTML ? uvdTrustedHTML.createHTML(html) : html;
+    }
+
+    // ==================== HELPER BRIDGE (v2.5 — BUG-005) ====================
+    // The userscript can't run yt-dlp directly (browser sandbox) and can't
+    // decrypt YouTube's signature ciphers (see BUG-004). v2.5 adds a tiny
+    // localhost daemon (helper/uvd-helper.py) that does both. The userscript
+    // POSTs a download request and polls a job endpoint for progress.
+    //
+    // Detection: on init we GET /health (unauthenticated). If reachable,
+    // the FAB grows a green dot and the download flow uses the helper.
+    // If not reachable, everything falls back to v2.4 behavior (clipboard
+    // yt-dlp command on YouTube, GM_download elsewhere).
+    //
+    // Auth: every authed request carries X-UVD-Token. Token is stored via
+    // GM_setValue (per-userscript secure storage) and entered once via a
+    // settings panel. Helper rejects non-allowlisted Origin headers, so
+    // even if a hostile page leaks the token, it can't trigger a download
+    // unless it ALSO satisfies the Origin whitelist baked into the helper.
+    const HELPER = {
+        url: 'http://127.0.0.1:34899',
+        // populated by detectHelper(); ui code reads HELPER.alive
+        alive: false,
+        version: null,
+        downloadDir: null,
+        tools: null,
+        // pollers we need to tear down on dialog close
+        activePoll: null,
+    };
+
+    function helperGetToken() {
+        try { return GM_getValue('helperToken', '') || ''; } catch (e) { return ''; }
+    }
+    function helperSetToken(t) {
+        try { GM_setValue('helperToken', t || ''); } catch (e) {}
+    }
+
+    // Tampermonkey's GM_xmlhttpRequest bypasses page CORS, which is critical
+    // because YouTube would otherwise block our cross-origin POST to the
+    // helper. We promisify it because async/await is much easier to follow
+    // than the onload/onerror callback dance.
+    function gmFetch(method, path, body, opts) {
+        opts = opts || {};
+        return new Promise((resolve, reject) => {
+            const headers = { 'Content-Type': 'application/json' };
+            const token = helperGetToken();
+            if (token && !opts.noAuth) headers['X-UVD-Token'] = token;
+            GM_xmlhttpRequest({
+                method: method,
+                url: HELPER.url + path,
+                headers: headers,
+                data: body == null ? undefined : JSON.stringify(body),
+                timeout: opts.timeout || 10000,
+                onload: (r) => {
+                    let json = null;
+                    try { json = r.responseText ? JSON.parse(r.responseText) : {}; } catch (e) {}
+                    if (r.status >= 200 && r.status < 300) resolve(json || {});
+                    else reject({ status: r.status, body: json || r.responseText });
+                },
+                onerror: () => reject({ status: 0, body: 'network error' }),
+                ontimeout: () => reject({ status: 0, body: 'timeout' }),
+                onabort: () => reject({ status: 0, body: 'aborted' }),
+            });
+        });
+    }
+
+    async function detectHelper() {
+        try {
+            const h = await gmFetch('GET', '/health', null, { timeout: 2500, noAuth: true });
+            HELPER.alive = h && h.status === 'ok';
+            HELPER.version = h && h.version;
+            HELPER.downloadDir = h && h.downloadDir;
+            HELPER.tools = h && h.tools;
+        } catch (e) {
+            HELPER.alive = false;
+        }
+        // Reflect state on the FAB.
+        const dot = document.querySelector('#uvd-fab .uvd-helper-dot');
+        if (dot) dot.style.background = HELPER.alive ? '#22c55e' : '#64748b';
+        return HELPER.alive;
+    }
+
+    async function helperStartDownload(payload) {
+        return gmFetch('POST', '/download', payload);
+    }
+    async function helperJobStatus(jobId) {
+        return gmFetch('GET', '/jobs/' + jobId);
+    }
+    async function helperCancelJob(jobId) {
+        return gmFetch('GET', '/jobs/' + jobId + '/cancel');
+    }
+    async function helperOpenDownloadDir() {
+        return gmFetch('POST', '/open-download-dir', {});
     }
 
     // ==================== CONFIGURATION ====================
@@ -512,6 +604,164 @@
             border-radius: 6px;
             color: #fff;
             font-size: 13px;
+        }
+
+        /* ===== v2.5: helper-bridge UI ===== */
+        #uvd-fab .uvd-helper-dot {
+            position: absolute;
+            bottom: 2px;
+            right: 2px;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #64748b;
+            border: 2px solid #1a1a1a;
+            transition: background 0.2s;
+        }
+        .uvd-gear-btn {
+            background: transparent;
+            border: 1px solid #444;
+            color: #aaa;
+            border-radius: 6px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 13px;
+            margin-right: auto; /* push to left in footer */
+        }
+        .uvd-gear-btn:hover { background: #2a2a2a; color: #fff; }
+        .uvd-helper-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            margin-left: 8px;
+        }
+        .uvd-helper-badge.alive  { background: #14532d; color: #86efac; }
+        .uvd-helper-badge.absent { background: #3f3f3f; color: #aaa; }
+        .uvd-helper-badge .uvd-helper-badge-dot {
+            width: 6px; height: 6px; border-radius: 50%;
+        }
+        .uvd-helper-badge.alive  .uvd-helper-badge-dot { background: #22c55e; }
+        .uvd-helper-badge.absent .uvd-helper-badge-dot { background: #94a3b8; }
+        .uvd-settings-modal {
+            position: absolute;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.85);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 12px;
+            z-index: 10;
+        }
+        .uvd-settings-panel {
+            background: #1f1f1f;
+            border: 1px solid #444;
+            border-radius: 10px;
+            padding: 24px;
+            width: 90%;
+            max-width: 500px;
+        }
+        .uvd-settings-panel h3 {
+            margin: 0 0 16px 0;
+            color: #fff;
+            font-size: 16px;
+        }
+        .uvd-settings-panel label {
+            display: block;
+            color: #ccc;
+            font-size: 12px;
+            margin: 12px 0 4px;
+        }
+        .uvd-settings-panel input {
+            font-family: ui-monospace, Consolas, monospace;
+        }
+        .uvd-settings-panel .uvd-settings-info {
+            font-size: 12px;
+            color: #888;
+            background: #161616;
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-top: 12px;
+            line-height: 1.5;
+        }
+        .uvd-settings-panel .uvd-settings-info code {
+            color: #c4b5fd;
+            font-family: ui-monospace, Consolas, monospace;
+        }
+        .uvd-settings-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 18px;
+            justify-content: flex-end;
+        }
+        .uvd-progress-view {
+            padding: 32px 24px;
+        }
+        .uvd-progress-view h3 {
+            color: #fff;
+            margin: 0 0 6px 0;
+            font-size: 15px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .uvd-progress-view .uvd-progress-sub {
+            color: #888;
+            font-size: 12px;
+            margin-bottom: 22px;
+        }
+        .uvd-progress-bar {
+            height: 10px;
+            background: #2a2a2a;
+            border-radius: 999px;
+            overflow: hidden;
+            margin-bottom: 14px;
+        }
+        .uvd-progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #6366f1, #a855f7);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        .uvd-progress-stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+            margin-bottom: 22px;
+            font-size: 12px;
+        }
+        .uvd-progress-stats .uvd-stat-label { color: #888; display: block; margin-bottom: 2px; }
+        .uvd-progress-stats .uvd-stat-value { color: #fff; font-weight: 500; font-family: ui-monospace, Consolas, monospace; }
+        .uvd-progress-status {
+            background: #161616;
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-bottom: 18px;
+            color: #ccc;
+            font-size: 12px;
+        }
+        .uvd-progress-status.error { background: #3f1d1d; color: #fecaca; }
+        .uvd-progress-status.done  { background: #14532d; color: #bbf7d0; }
+        .uvd-progress-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+        .uvd-progress-log {
+            background: #0d0d0d;
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-top: 18px;
+            max-height: 140px;
+            overflow-y: auto;
+            font-family: ui-monospace, Consolas, monospace;
+            font-size: 11px;
+            color: #888;
+            white-space: pre-wrap;
+            word-break: break-all;
         }
     `);
 
@@ -1089,6 +1339,12 @@
                         <span class="uvd-thread-val" id="uvd-thread-display">${CONFIG.defaultThreads}</span>
                     </div>
                     <div class="uvd-actions">
+                        <button class="uvd-gear-btn" id="uvd-settings" title="Helper settings">⚙️ Settings
+                            <span class="uvd-helper-badge ${HELPER.alive ? 'alive' : 'absent'}" id="uvd-helper-badge">
+                                <span class="uvd-helper-badge-dot"></span>
+                                ${HELPER.alive ? 'helper running' : 'no helper'}
+                            </span>
+                        </button>
                         <button class="uvd-btn uvd-btn-copy" id="uvd-copy-url">📋 Copy URL</button>
                         <button class="uvd-btn uvd-btn-secondary" id="uvd-copy-all">📦 Copy All URLs</button>
                         <button class="uvd-btn uvd-btn-primary" id="uvd-download-btn">⬇️ Download</button>
@@ -1138,6 +1394,16 @@
         threadSlider.addEventListener('input', () => {
             threadDisplay.textContent = threadSlider.value;
         });
+
+        // Settings (helper config)
+        overlay.querySelector('#uvd-settings').addEventListener('click', () => {
+            openSettingsModal(overlay);
+        });
+
+        // Refresh helper badge whenever the dialog opens — the helper may
+        // have come up since the last detection (e.g. user just ran the
+        // installer).
+        detectHelper().then(() => updateHelperBadge(overlay));
 
         // Download
         overlay.querySelector('#uvd-download-btn').addEventListener('click', () => {
@@ -1351,7 +1617,221 @@
         document.addEventListener('keydown', escHandler);
     }
 
+    // ==================== HELPER UI ===================================
+    // Settings modal: paste/clear the helper token, see status, link to
+    // the install command. Lives inside the dialog overlay so it inherits
+    // z-index and dismissal.
+    function openSettingsModal(overlay) {
+        if (overlay.querySelector('.uvd-settings-modal')) return;
+        const currentToken = helperGetToken();
+        const installCmd = 'powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/BarnsL/universal-video-download/main/helper/install.ps1 | iex"';
+        const modal = document.createElement('div');
+        modal.className = 'uvd-settings-modal';
+        setHTML(modal, `
+            <div class="uvd-settings-panel">
+                <h3>⚙️ Helper Settings</h3>
+                <div>Status: <span class="uvd-helper-badge ${HELPER.alive ? 'alive' : 'absent'}">
+                    <span class="uvd-helper-badge-dot"></span>
+                    ${HELPER.alive ? `running (v${HELPER.version || '?'})` : 'not running'}
+                </span></div>
+                ${HELPER.alive && HELPER.downloadDir ? `<div style="font-size:11px;color:#888;margin-top:6px;">Download dir: <code style="color:#c4b5fd;">${HELPER.downloadDir}</code></div>` : ''}
+                <label for="uvd-token-input">Token (64 hex characters)</label>
+                <input type="password" id="uvd-token-input" value="${currentToken}" placeholder="paste from install.ps1 output…" autocomplete="off" spellcheck="false">
+                <div class="uvd-settings-info">
+                    The helper is a small localhost daemon that runs yt-dlp on your behalf.<br>
+                    Install on Windows:<br>
+                    <code style="user-select:all;">${installCmd}</code><br>
+                    The installer copies the token to your clipboard.
+                </div>
+                <div class="uvd-settings-actions">
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-token-test">Test</button>
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-token-cancel">Cancel</button>
+                    <button class="uvd-btn uvd-btn-primary" id="uvd-token-save">Save</button>
+                </div>
+            </div>
+        `);
+        overlay.querySelector('#uvd-dialog').appendChild(modal);
+
+        const close = () => modal.remove();
+        modal.addEventListener('click', e => { if (e.target === modal) close(); });
+        modal.querySelector('#uvd-token-cancel').addEventListener('click', close);
+        modal.querySelector('#uvd-token-save').addEventListener('click', () => {
+            helperSetToken(modal.querySelector('#uvd-token-input').value.trim());
+            detectHelper().then(() => updateHelperBadge(overlay));
+            close();
+        });
+        modal.querySelector('#uvd-token-test').addEventListener('click', async () => {
+            const btn = modal.querySelector('#uvd-token-test');
+            const prev = btn.textContent;
+            btn.textContent = 'Testing…';
+            // Save first so gmFetch uses the new token.
+            helperSetToken(modal.querySelector('#uvd-token-input').value.trim());
+            try {
+                await gmFetch('GET', '/jobs');
+                btn.textContent = '✅ Token works';
+                detectHelper().then(() => updateHelperBadge(overlay));
+            } catch (e) {
+                btn.textContent = e.status === 401 ? '❌ Bad token' : `❌ ${e.status || 'unreachable'}`;
+            }
+            setTimeout(() => { btn.textContent = prev; }, 2500);
+        });
+    }
+
+    function updateHelperBadge(overlay) {
+        const badge = overlay.querySelector('#uvd-helper-badge');
+        if (!badge) return;
+        badge.classList.toggle('alive', !!HELPER.alive);
+        badge.classList.toggle('absent', !HELPER.alive);
+        // Replace text node (keep the dot span as first child).
+        const textNodes = [...badge.childNodes].filter(n => n.nodeType === Node.TEXT_NODE);
+        const label = HELPER.alive ? 'helper running' : 'no helper';
+        if (textNodes.length) textNodes[0].nodeValue = ' ' + label;
+        else badge.appendChild(document.createTextNode(' ' + label));
+    }
+
+    // Progress overlay (replaces the dialog body when a helper job is
+    // running). We keep the header so the user still sees the title.
+    function renderProgressView(overlay, job, payload) {
+        const dialog = overlay.querySelector('#uvd-dialog');
+        // Drop the streams/footer; keep just the header.
+        [...dialog.querySelectorAll('.uvd-content, .uvd-footer, .uvd-tabs')].forEach(el => el.remove());
+
+        const view = document.createElement('div');
+        view.className = 'uvd-progress-view';
+        view.id = 'uvd-progress-view';
+        setHTML(view, `
+            <h3 title="${payload.filename || job.filename || 'download'}">⬇️ ${payload.filename || job.filename || 'Downloading…'}</h3>
+            <div class="uvd-progress-sub">job <code style="user-select:all;">${job.id}</code></div>
+            <div class="uvd-progress-bar"><div class="uvd-progress-fill" id="uvd-pf"></div></div>
+            <div class="uvd-progress-stats">
+                <div><span class="uvd-stat-label">Progress</span><span class="uvd-stat-value" id="uvd-p-pct">0.0%</span></div>
+                <div><span class="uvd-stat-label">Downloaded</span><span class="uvd-stat-value" id="uvd-p-bytes">—</span></div>
+                <div><span class="uvd-stat-label">Speed</span><span class="uvd-stat-value" id="uvd-p-speed">—</span></div>
+                <div><span class="uvd-stat-label">ETA</span><span class="uvd-stat-value" id="uvd-p-eta">—</span></div>
+            </div>
+            <div class="uvd-progress-status" id="uvd-p-status">Starting…</div>
+            <div class="uvd-progress-actions" id="uvd-p-actions">
+                <button class="uvd-btn uvd-btn-secondary" id="uvd-p-cancel">Cancel</button>
+                <button class="uvd-btn uvd-btn-secondary" id="uvd-p-back">Back to streams</button>
+            </div>
+            <pre class="uvd-progress-log" id="uvd-p-log" style="display:none;"></pre>
+        `);
+        dialog.appendChild(view);
+
+        const pf = view.querySelector('#uvd-pf');
+        const pct = view.querySelector('#uvd-p-pct');
+        const bytes = view.querySelector('#uvd-p-bytes');
+        const speed = view.querySelector('#uvd-p-speed');
+        const eta = view.querySelector('#uvd-p-eta');
+        const status = view.querySelector('#uvd-p-status');
+        const actions = view.querySelector('#uvd-p-actions');
+        const log = view.querySelector('#uvd-p-log');
+
+        view.querySelector('#uvd-p-cancel').addEventListener('click', () => {
+            helperCancelJob(job.id).catch(() => {});
+        });
+        view.querySelector('#uvd-p-back').addEventListener('click', () => {
+            stopProgressPoll();
+            removeDialog();
+            setTimeout(showDialog, 100);
+        });
+
+        const fmt = (n) => {
+            if (!n) return '—';
+            if (n < 1024) return n + ' B';
+            if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+            if (n < 1073741824) return (n / 1048576).toFixed(2) + ' MB';
+            return (n / 1073741824).toFixed(2) + ' GB';
+        };
+        const sizeStr = (cur, total) => total ? `${fmt(cur)} / ${fmt(total)}` : fmt(cur);
+
+        stopProgressPoll();
+        HELPER.activePoll = setInterval(async () => {
+            let j;
+            try { j = await helperJobStatus(job.id); }
+            catch (e) {
+                status.textContent = `Lost connection to helper: ${e.status || e.body || 'unknown'}`;
+                status.className = 'uvd-progress-status error';
+                stopProgressPoll();
+                return;
+            }
+            const p = Math.max(0, Math.min(100, j.progress || 0));
+            pf.style.width = p + '%';
+            pct.textContent = p.toFixed(1) + '%';
+            bytes.textContent = sizeStr(j.bytesDownloaded || 0, j.bytesTotal || 0);
+            speed.textContent = j.speed || '—';
+            eta.textContent = j.eta || '—';
+
+            if (j.status === 'running' || j.status === 'queued') {
+                status.textContent = j.status === 'queued' ? 'Queued…' : 'Downloading…';
+                status.className = 'uvd-progress-status';
+            } else if (j.status === 'done') {
+                status.textContent = `Done → ${j.outputPath || HELPER.downloadDir || ''}`;
+                status.className = 'uvd-progress-status done';
+                setHTML(actions, `
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-p-reveal">📁 Open folder</button>
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-p-log-toggle">📜 Log</button>
+                    <button class="uvd-btn uvd-btn-primary" id="uvd-p-done">Done</button>
+                `);
+                actions.querySelector('#uvd-p-reveal').addEventListener('click', () => helperOpenDownloadDir().catch(() => {}));
+                actions.querySelector('#uvd-p-log-toggle').addEventListener('click', async () => {
+                    log.style.display = log.style.display === 'none' ? 'block' : 'none';
+                    if (log.style.display === 'block') {
+                        try {
+                            const r = await gmFetch('GET', '/jobs/' + job.id + '/log');
+                            log.textContent = (r.log || []).join('\n');
+                            log.scrollTop = log.scrollHeight;
+                        } catch (e) {}
+                    }
+                });
+                actions.querySelector('#uvd-p-done').addEventListener('click', () => removeDialog());
+                stopProgressPoll();
+            } else if (j.status === 'cancelled') {
+                status.textContent = 'Cancelled.';
+                status.className = 'uvd-progress-status error';
+                stopProgressPoll();
+            } else if (j.status === 'error') {
+                status.textContent = `Error: ${j.error || 'unknown'}`;
+                status.className = 'uvd-progress-status error';
+                setHTML(actions, `
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-p-log-toggle">📜 Log</button>
+                    <button class="uvd-btn uvd-btn-secondary" id="uvd-p-back2">Back to streams</button>
+                `);
+                actions.querySelector('#uvd-p-log-toggle').addEventListener('click', async () => {
+                    log.style.display = log.style.display === 'none' ? 'block' : 'none';
+                    if (log.style.display === 'block') {
+                        try {
+                            const r = await gmFetch('GET', '/jobs/' + job.id + '/log');
+                            log.textContent = (r.log || []).join('\n');
+                            log.scrollTop = log.scrollHeight;
+                        } catch (e) {}
+                    }
+                });
+                actions.querySelector('#uvd-p-back2').addEventListener('click', () => {
+                    stopProgressPoll();
+                    removeDialog();
+                    setTimeout(showDialog, 100);
+                });
+                stopProgressPoll();
+            }
+        }, 800);
+    }
+
+    function stopProgressPoll() {
+        if (HELPER.activePoll) {
+            clearInterval(HELPER.activePoll);
+            HELPER.activePoll = null;
+        }
+    }
+
     // ==================== DOWNLOAD HANDLER ====================
+    // Resolution order:
+    //   1. Helper available + token set → POST /download, show progress UI.
+    //      Works for ALL stream types including YouTube cipher-encrypted.
+    //   2. No helper, but a direct URL is available → GM_download / anchor.
+    //   3. No helper, YouTube cipher case → clipboard yt-dlp command
+    //      (v2.4 behavior; user pastes into a shell).
+    //   4. Nothing else → useful error.
     function performDownload(selectedItem, overlay) {
         const url = selectedItem.dataset.url;
         const ext = selectedItem.dataset.ext || 'mp4';
@@ -1360,37 +1840,58 @@
         const filename = overlay.querySelector('#uvd-filename').value || 'download';
         const fullFilename = `${sanitizeFilename(filename)}.${ext}`;
 
+        const isYouTube = CONFIG.supportedSites.youtube.test(location.hostname);
+        const watchUrl = isYouTube ? location.href.split(/[&?]list=|&t=/)[0] : location.href;
+
+        // Path 1: helper.
+        if (HELPER.alive && helperGetToken()) {
+            const payload = {
+                // For YouTube cipher streams we pass the WATCH URL plus itag —
+                // yt-dlp re-resolves the format. For direct-URL streams we
+                // still pass the watch URL when on YouTube (cleaner) and the
+                // direct URL on other sites.
+                url: isYouTube ? watchUrl : (url || location.href),
+                itag: itag,
+                type: type || (selectedItem.dataset.type === 'subtitle' ? 'subtitle' : 'video'),
+                ext: ext,
+                filename: filename,
+            };
+            if (payload.type === 'subtitle') {
+                // language code carried in data-quality / data-codec; we
+                // settle for 'en' fallback because the userscript doesn't
+                // currently surface the lang to the dataset.
+                payload.lang = (selectedItem.querySelector('.uvd-col-codec')?.textContent || 'en').trim() || 'en';
+            }
+            helperStartDownload(payload).then((job) => {
+                renderProgressView(overlay, job, payload);
+            }, (err) => {
+                if (err && err.status === 401) {
+                    alert('Helper rejected token. Click ⚙️ Settings and paste the token again.');
+                } else {
+                    alert('Helper request failed: ' + (err && (err.body?.error || err.body) || err?.status || 'unknown'));
+                }
+            });
+            return;
+        }
+
+        // Path 3: YouTube cipher, no helper → clipboard yt-dlp command.
         if (!url) {
-            // BUG-004 fallback: YouTube's modern DASH streams ship a
-            // `signatureCipher` blob instead of a plain `url`, and decoding it
-            // requires the per-version JS player's `n`/`sig` deobfuscation
-            // functions — far out of scope for a single-file userscript. The
-            // best a userscript can do here is hand off to yt-dlp, which does
-            // implement the decoder. We build a ready-to-run command and copy
-            // it to the clipboard so the user just has to paste it into a
-            // shell. itag was added to the stream items in v2.4 specifically
-            // to make this handoff one-click.
-            if (itag && CONFIG.supportedSites.youtube.test(location.hostname)) {
-                const watchUrl = location.href.split('&')[0]; // strip &list= / &t= so yt-dlp sees a clean URL
-                // Video-only adaptive streams need to be merged with bestaudio
-                // to be useful; everything else (progressive, audio-only,
-                // subtitles) is fine with the raw itag.
+            if (itag && isYouTube) {
                 const fmt = type === 'video-only' ? `${itag}+bestaudio` : itag;
                 const merge = type === 'video-only' ? ' --merge-output-format mp4' : '';
                 const cmd = `yt-dlp -f ${fmt}${merge} "${watchUrl}" -o "${fullFilename}"`;
                 navigator.clipboard.writeText(cmd).then(() => {
-                    alert(`This YouTube stream is signature-encrypted — direct download isn't possible from the browser.\n\nA ready-to-run yt-dlp command has been copied to your clipboard:\n\n${cmd}\n\nPaste it into PowerShell or a terminal. Requires yt-dlp installed (winget install yt-dlp).`);
+                    alert(`This YouTube stream is signature-encrypted — direct download isn't possible from the browser.\n\nA ready-to-run yt-dlp command has been copied to your clipboard:\n\n${cmd}\n\nPaste it into PowerShell or a terminal. Requires yt-dlp installed (winget install yt-dlp).\n\nTip: install the helper for one-click downloads — click ⚙️ Settings.`);
                 }, () => {
-                    // Clipboard write blocked (rare; some CSPs do this).
                     prompt('Copy this yt-dlp command and run it in a terminal:', cmd);
                 });
                 return;
             }
-            alert('No direct download URL available.\n\nThis stream may be:\n• DRM protected\n• Using blob/MediaSource (not directly downloadable)\n• Signature-encrypted (YouTube DASH)\n\nTry "Copy URL" and use yt-dlp or another tool.');
+            alert('No direct download URL available.\n\nThis stream may be:\n• DRM protected\n• Using blob/MediaSource (not directly downloadable)\n• Signature-encrypted (YouTube DASH)\n\nInstall the helper (⚙️ Settings) or use "Copy URL" with yt-dlp.');
             return;
         }
 
-        // Try GM_download (Tampermonkey's cross-origin download)
+        // Path 2: direct URL → GM_download.
         try {
             GM_download({
                 url: url,
@@ -1427,9 +1928,12 @@
         fab.title = 'Download Video';
         // Trusted Types wrapper — see top of file (BUG-003 fix). Without this,
         // YouTube's CSP throws here and the entire init halts.
+        // The .uvd-helper-dot is colored by detectHelper(): green if the
+        // local helper daemon is reachable, slate otherwise.
         setHTML(fab, `
             <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
             <span class="uvd-badge" style="display:none;">0</span>
+            <span class="uvd-helper-dot" title="Helper status"></span>
         `);
         fab.addEventListener('click', showDialog);
         document.body.appendChild(fab);
@@ -1457,6 +1961,9 @@
 
     // ==================== LIFECYCLE ====================
     function removeDialog() {
+        // If a download is in flight, stop the progress poller so we
+        // don't keep spamming the helper after the user closes the UI.
+        stopProgressPoll();
         const overlay = document.getElementById('uvd-overlay');
         if (overlay) {
             overlay.classList.remove('visible');
@@ -1566,6 +2073,12 @@
 
     // ==================== INITIALIZATION ====================
     createFab();
+
+    // Probe the helper once at startup. Cheap (single GET to localhost
+    // with a short timeout), and lets us color the FAB dot before the
+    // user even opens the dialog. We re-probe each time the dialog
+    // opens too — see showDialog().
+    detectHelper();
 
     // Initial scan
     setTimeout(() => {

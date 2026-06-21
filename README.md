@@ -1,8 +1,14 @@
 # Universal Video Download
 
-A single-file Tampermonkey userscript that brings **NewPipe-style** download options to **any website with video content**. Pick resolution, container, codec, audio track, subtitles and parallel-thread count from a clean dark dialog, then save the file locally with the browser's download manager.
+A Tampermonkey userscript that brings **NewPipe-style** download options to **any website with video content**. Pick resolution, container, codec, audio track, subtitles and parallel-thread count from a clean dark dialog, then save the file locally.
 
-> One file. ~1,400 lines of vanilla JS. No build step. No dependencies. Works offline once installed.
+**Two modes:**
+
+- **Standalone** — direct downloads via the browser's download manager. Works on most sites out of the box. On YouTube, signature-encrypted streams get a one-click `yt-dlp` command copied to your clipboard.
+- **With helper** (`helper/install.ps1`) — a tiny localhost daemon runs `yt-dlp` for you. The Download button just works end-to-end on every site, YouTube included. Progress bar lives in the dialog. See [`helper/README.md`](./helper/README.md).
+
+> Userscript: one file, vanilla JS, no build step.
+> Helper: one file, Python stdlib only.
 
 ---
 
