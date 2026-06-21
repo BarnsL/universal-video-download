@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.6.0
+// @version      2.7.0
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -1734,13 +1734,20 @@
                 <div class="uvd-content">
                     <div class="uvd-empty" style="padding:40px;">
                         <p style="font-size:15px;color:#ccc;margin-bottom:16px;">No downloadable video/audio found on this page.</p>
+                        ${HELPER.alive && helperGetToken() ? `
+                        <div style="background:#1e1b4b;border:1px solid #6366f1;border-radius:8px;padding:14px;margin-bottom:18px;">
+                            <p style="font-size:13px;color:#c7d2fe;margin:0 0 10px 0;line-height:1.5;">
+                                <strong>Try yt-dlp on this page.</strong> Many sites (animepahe, embedded players, niche streamers) are supported by yt-dlp's site-specific extractors even when the in-page scan finds nothing.
+                            </p>
+                            <button class="uvd-btn uvd-btn-primary" id="uvd-try-ytdlp">▶ Queue this page in yt-dlp</button>
+                        </div>` : ''}
                         <p style="font-size:13px;color:#888;line-height:1.6;">
                             <strong>Tips:</strong><br>
                             • Make sure the video has started playing<br>
                             • Some sites use DRM protection (Widevine/FairPlay) which cannot be bypassed<br>
                             • Blob/MediaSource URLs require the video to be actively streaming<br>
                             • Try refreshing the page with the script enabled<br>
-                            • Embedded iframes from other domains cannot be accessed
+                            • Embedded iframes from other domains cannot be accessed in-page${HELPER.alive && helperGetToken() ? ' — use the helper button above' : ''}
                         </p>
                         <p style="font-size:12px;color:#555;margin-top:16px;">
                             Captured network requests: ${capturedStreams.length}
@@ -1765,7 +1772,49 @@
             removeDialog();
             setTimeout(showDialog, 500);
         });
+        // v2.7.0: "Queue this page in yt-dlp" — when no in-page streams
+        // are detected and the helper is up, hand the page URL straight
+        // to the daemon. yt-dlp's extractors cover hundreds of sites
+        // (animepahe, niche streamers, cross-origin iframe-only pages,
+        // etc.) that the userscript's in-page scan can't see.
+        overlay.querySelector('#uvd-try-ytdlp')?.addEventListener('click', () => {
+            queuePageThroughHelper(overlay);
+        });
         document.addEventListener('keydown', escHandler);
+    }
+
+    // Queue the current page URL through the helper without any
+    // itag/type/filename — yt-dlp picks the best by itself. Used by the
+    // "No streams found" dialog and by the generic site-button injector.
+    function queuePageThroughHelper(overlay) {
+        if (!HELPER.alive || !helperGetToken()) {
+            alert('Helper is not running or token is missing. Click ⚙️ Settings to set one up.');
+            return;
+        }
+        const cleanUrl = location.href.split('#')[0];
+        const titleGuess = sanitizeFilename(document.title || location.hostname);
+        const payload = {
+            url: cleanUrl,
+            type: 'video',          // generic — yt-dlp picks
+            ext: 'mp4',             // hint only; yt-dlp overrides
+            filename: titleGuess,
+        };
+        helperStartDownload(payload).then((job) => {
+            // Reuse the toast/queue refresh path. If we're in the
+            // empty dialog, also swap to the queue panel so the user
+            // can watch progress without manually clicking.
+            showQueueToast(overlay, job, payload);
+            pollQueueOnce(overlay);
+            setTimeout(() => {
+                if (document.getElementById('uvd-overlay')) openQueuePanel(overlay);
+            }, 400);
+        }, (err) => {
+            if (err && err.status === 401) {
+                alert('Helper rejected token. Open ⚙️ Settings and paste the token again.');
+            } else {
+                alert('Helper request failed: ' + ((err && err.body && err.body.error) || (err && err.status) || 'unknown'));
+            }
+        });
     }
 
     // ==================== HELPER UI ===================================
@@ -2324,8 +2373,101 @@
             return;
         }
 
+        // v2.7.0 — on any non-YouTube site we know about (or even
+        // generic), try to find the site's own "Download" button and
+        // park our companion right next to it. Cheap (DOM query is
+        // bounded by querySelectorAll on 3 tag names) and idempotent.
+        if (!document.getElementById('uvd-site-btn')) injectGenericSiteButton();
+
         if (hasVideo) {
             showFab();
+        }
+    }
+
+    // v2.7.0 — Generic site-button companion.
+    // For sites that already have a "Download" button (animepahe,
+    // CDN-fronted clip sites, etc.), drop our blue button immediately
+    // next to it so the user finds it without thinking. Idempotent —
+    // safe to call repeatedly on SPA navigation / DOM mutations.
+    //
+    // We also avoid double-injection on YouTube (which has its own
+    // injector) and on the AtoZ flow.
+    function injectGenericSiteButton() {
+        if (CONFIG.supportedSites.youtube.test(location.hostname)) return;
+        if (CONFIG.supportedSites.atoz.test(location.hostname)) return;
+        if (document.getElementById('uvd-site-btn')) return;
+
+        // Find candidates: clickable elements whose direct text content
+        // (trimmed) is exactly "Download" — case-insensitive. We avoid
+        // matching long labels like "Free Download" or "Download App"
+        // so we don't shove the button next to a marketing CTA. We
+        // also skip elements that are inside our own dialog.
+        const TEXT_RE = /^download$/i;
+        const skipInside = (el) => {
+            for (let n = el; n; n = n.parentElement) {
+                if (n.id === 'uvd-overlay' || n.id === 'uvd-fab') return true;
+            }
+            return false;
+        };
+        const candidates = Array.from(
+            document.querySelectorAll('button, a, [role="button"]')
+        ).filter(el => {
+            if (skipInside(el)) return false;
+            // Direct (own) text only — descendant text noise is too noisy.
+            const own = Array.from(el.childNodes)
+                .filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => n.nodeValue.trim())
+                .join(' ').trim();
+            const aria = (el.getAttribute('aria-label') || '').trim();
+            const title = (el.getAttribute('title') || '').trim();
+            return TEXT_RE.test(own) || TEXT_RE.test(aria) || TEXT_RE.test(title);
+        });
+        if (!candidates.length) return;
+
+        // Pick the most user-visible one (largest bounding rect).
+        const target = candidates
+            .map(el => ({ el, rect: el.getBoundingClientRect() }))
+            .filter(x => x.rect.width > 20 && x.rect.height > 14)
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+        if (!target) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'uvd-site-btn';
+        btn.title = 'Universal Video Download — try yt-dlp on this page or open the streams dialog';
+        btn.style.cssText = `
+            display: inline-flex; align-items: center; gap: 6px;
+            margin: 8px 0 0 0;
+            padding: 8px 14px;
+            background: linear-gradient(135deg, #065fd4, #3ea6ff);
+            color: #fff; border: none; border-radius: 8px;
+            font-size: 13px; font-weight: 500; cursor: pointer;
+            box-shadow: 0 2px 8px rgba(6,95,212,0.3);
+            font-family: inherit;
+        `;
+        setHTML(btn, `<svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> Download via UVD`);
+        btn.addEventListener('click', () => showDialog());
+
+        // Place directly after the site's download button. If the
+        // parent is inline / inline-flex, wrap so we appear underneath.
+        const parent = target.el.parentElement;
+        if (!parent) return;
+        const parentDisplay = (getComputedStyle(parent).display || '').toLowerCase();
+        if (parentDisplay.startsWith('inline') || parentDisplay === 'flex') {
+            // Wrap in a block to force a newline under the existing button.
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'display:block;margin:6px 0 0 0;';
+            wrap.appendChild(btn);
+            if (target.el.nextSibling) {
+                parent.insertBefore(wrap, target.el.nextSibling);
+            } else {
+                parent.appendChild(wrap);
+            }
+        } else {
+            if (target.el.nextSibling) {
+                parent.insertBefore(btn, target.el.nextSibling);
+            } else {
+                parent.appendChild(btn);
+            }
         }
     }
 
