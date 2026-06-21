@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.8.0
+// @version      2.8.1
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -2757,13 +2757,21 @@
     }
 
     // Anchor finder for sites that don't have any download button at
-    // all. We look for a video iframe whose src points at a known
-    // embed/player host pattern and return the iframe element. If
-    // there's no iframe but there's a <video> element with a usable
-    // bounding box (height > 200px), use that instead.
+    // all. We look for, in priority order:
+    //   1. A large iframe whose src points at a known embed host
+    //   2. A large iframe regardless of host (v2.8.1 — covers cases
+    //      where the player iframe is injected by JS after page load
+    //      with a src we don't recognize, e.g. wcoanimedub.tv's
+    //      cizgi/video-page-main wrapper)
+    //   3. A large in-page <video>
+    //   4. A known video-container wrapper (.video-page-main,
+    //      #player, etc.) — even when empty, the embed lands inside
+    //      it, so dropping the button right after the wrapper still
+    //      lands in a sensible place
     function findVideoIframeAnchor() {
-        const KNOWN_EMBED_RE = /(?:^|\.)(?:wcostream|wcofun|embed\.|mp4upload|streamtape|doodstream|dood\.|vidstreaming|vidstream|vidsrc|vidcdn|megacloud|megaplay|filemoon|mixdrop|streamhg|streamhide|vidoza|vidlox|sbplay|sbembed|hydrax|kwik\.|kwik|emturbovid|fembed|stape\.fun|abyss\.to|playerwish|swiftplayers|streamwish)/i;
+        const KNOWN_EMBED_RE = /(?:^|\.)(?:wcostream|wcofun|embed\.|mp4upload|streamtape|doodstream|dood\.|vidstreaming|vidstream|vidsrc|vidcdn|megacloud|megaplay|filemoon|mixdrop|streamhg|streamhide|vidoza|vidlox|sbplay|sbembed|hydrax|kwik\.|kwik|emturbovid|fembed|stape\.fun|abyss\.to|playerwish|swiftplayers|streamwish|cizgi)/i;
         const EMBED_PATH_RE = /\/(?:embed|e|player|video|play|stream)\b/i;
+        const MIN_W = 320, MIN_H = 180;
 
         const iframes = Array.from(document.querySelectorAll('iframe'));
         const ranked = iframes.map(f => {
@@ -2775,19 +2783,47 @@
                 if (KNOWN_EMBED_RE.test(u.hostname)) score += 60;
                 if (EMBED_PATH_RE.test(u.pathname)) score += 20;
             } catch (_) {}
-            // Iframes large enough to plausibly be a player
-            if (r.width > 320 && r.height > 200) score += 30;
-            return { el: f, score, area: r.width * r.height };
-        }).filter(x => x.score >= 30)
+            // v2.8.1 — any visibly-sized iframe is a plausible player.
+            // Score it by area so the biggest wins even with no host
+            // match. We still skip tiny tracker pixels (< MIN_W/MIN_H).
+            if (r.width >= MIN_W && r.height >= MIN_H) score += 30;
+            return { el: f, score, area: r.width * r.height, w: r.width, h: r.height };
+        }).filter(x => x.w >= MIN_W && x.h >= MIN_H)
           .sort((a, b) => (b.score - a.score) || (b.area - a.area));
         if (ranked.length) return ranked[0].el;
 
         const videos = Array.from(document.querySelectorAll('video'));
         const vid = videos
             .map(v => ({ el: v, r: v.getBoundingClientRect() }))
-            .filter(x => x.r.height > 200 && x.r.width > 320)
+            .filter(x => x.r.height >= MIN_H && x.r.width >= MIN_W)
             .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height))[0];
-        return vid ? vid.el : null;
+        if (vid) return vid.el;
+
+        // v2.8.1 fallback — common wrapper selectors. Catches sites
+        // where the player iframe is injected by JS only after user
+        // interaction (Click-to-load gates, ad bypass scripts, etc.),
+        // OR where the iframe lives behind a same-origin shadow root.
+        // We pick the largest matching element by area.
+        const WRAPPER_SELECTORS = [
+            '.video-page-main', '.video-page', '#video', '#videoplayer',
+            '#player', '#player-container', '.player-container',
+            '.video-container', '.video-wrapper', '.embed-container',
+            '.episode-video', '.episode-player', '[id*="player"]',
+            '[class*="player-wrap"]',
+        ];
+        const wrappers = [];
+        for (const sel of WRAPPER_SELECTORS) {
+            try {
+                document.querySelectorAll(sel).forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= MIN_W && r.height >= 80) {
+                        wrappers.push({ el, area: r.width * r.height });
+                    }
+                });
+            } catch (_) {}
+        }
+        wrappers.sort((a, b) => b.area - a.area);
+        return wrappers.length ? wrappers[0].el : null;
     }
 
     function placeUvdButtonAfter(anchor, label) {
