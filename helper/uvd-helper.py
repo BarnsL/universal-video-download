@@ -34,7 +34,65 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
+
+
+_real_print = print  # capture before any further indirection
+
+def safe_print(*args, **kwargs) -> None:
+    """`print` swallowing OSError so pythonw.exe (which connects stdout/
+    stderr to NUL) can't crash us with EBADF on a flush. Stdout messages
+    are informational only — losing them is fine."""
+    try:
+        _real_print(*args, **kwargs)
+    except OSError:
+        pass
+
+
+def augment_path_windows() -> None:
+    """winget-installed binaries (yt-dlp, ffmpeg, etc.) live under
+    `%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\<id>\\...` and are normally
+    surfaced via shims in `%LOCALAPPDATA%\\Microsoft\\WinGet\\Links`. Those
+    PATH additions only land in PROCESSES STARTED AFTER the install.
+    The helper is started by a long-lived parent (PowerShell session,
+    Startup .vbs, etc.) that may have stale PATH at the moment.
+
+    To make the helper resilient, we walk the WinGet locations
+    ourselves at startup and prepend any directory that contains an
+    executable we care about. Same idea for ffmpeg's bin dir under
+    `%ProgramFiles%`."""
+    if sys.platform != "win32":
+        return
+    additions: list[str] = []
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    if local.is_dir():
+        links = local / "Microsoft" / "WinGet" / "Links"
+        if links.is_dir():
+            additions.append(str(links))
+        packages = local / "Microsoft" / "WinGet" / "Packages"
+        if packages.is_dir():
+            for sub in packages.iterdir():
+                if not sub.is_dir():
+                    continue
+                # Most winget packages put their exes at the package
+                # root; some nest under bin/. Both are cheap to add.
+                if any((sub / e).exists() for e in ("yt-dlp.exe", "ffmpeg.exe")):
+                    additions.append(str(sub))
+                bin_ = sub / "bin"
+                if bin_.is_dir() and any(b.suffix.lower() == ".exe" for b in bin_.iterdir()):
+                    additions.append(str(bin_))
+    # Common ffmpeg shipped via choco / manual unzip locations.
+    for cand in (
+        Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "ffmpeg" / "bin",
+        Path("D:/Programs/ffmpeg-8.1.1/ffmpeg-8.1.1-full_build/bin"),
+    ):
+        if cand.is_dir():
+            additions.append(str(cand))
+    if additions:
+        os.environ["PATH"] = os.pathsep.join(additions + [os.environ.get("PATH", "")])
+
+
+augment_path_windows()
 DEFAULT_PORT = 34899
 MAX_LOG_LINES = 400
 MAX_JOBS_KEPT = 50
@@ -124,7 +182,7 @@ def load_or_init_config() -> dict:
             cfg_file.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
             return cfg
         except Exception as e:
-            print(f"warn: config unreadable ({e}); regenerating", file=sys.stderr)
+            safe_print(f"warn: config unreadable ({e}); regenerating", file=sys.stderr)
     cfg = {
         "token": secrets.token_hex(32),
         "port": DEFAULT_PORT,
@@ -578,10 +636,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     if "--print-token" in sys.argv:
-        print(CONFIG["token"])
+        safe_print(CONFIG["token"])
         return 0
     if "--print-config" in sys.argv:
-        print(json.dumps({**CONFIG, "configFile": str(config_dir() / "config.json")},
+        safe_print(json.dumps({**CONFIG, "configFile": str(config_dir() / "config.json")},
                          indent=2))
         return 0
 
@@ -589,16 +647,16 @@ def main() -> int:
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError as e:
-        print(f"failed to bind 127.0.0.1:{port}: {e}", file=sys.stderr)
+        safe_print(f"failed to bind 127.0.0.1:{port}: {e}", file=sys.stderr)
         return 1
-    print(f"uvd-helper v{VERSION} listening on http://127.0.0.1:{port}")
-    print(f"  config:    {config_dir() / 'config.json'}")
-    print(f"  downloads: {DOWNLOAD_DIR}")
-    print("  token:     (use --print-token to retrieve; paste into the userscript settings)")
+    safe_print(f"uvd-helper v{VERSION} listening on http://127.0.0.1:{port}")
+    safe_print(f"  config:    {config_dir() / 'config.json'}")
+    safe_print(f"  downloads: {DOWNLOAD_DIR}")
+    safe_print("  token:     (use --print-token to retrieve; paste into the userscript settings)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nshutting down")
+        safe_print("\nshutting down")
         server.shutdown()
     return 0
 
