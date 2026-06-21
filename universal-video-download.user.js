@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.5.1
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -13,6 +13,8 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @connect      *
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -119,14 +121,28 @@
     }
 
     async function detectHelper() {
+        // We keep the last error around so the Settings panel can show
+        // it. The most common failure modes:
+        //   - Tampermonkey blocked the request because @connect doesn't
+        //     match 127.0.0.1 (fixed by the explicit @connect entries
+        //     in the header above).
+        //   - Chromium's Private Network Access requires the helper to
+        //     send `Access-Control-Allow-Private-Network: true` on the
+        //     preflight (helper does this from v1.0.2 on).
+        //   - User hasn't run the installer; helper isn't listening.
         try {
             const h = await gmFetch('GET', '/health', null, { timeout: 2500, noAuth: true });
             HELPER.alive = h && h.status === 'ok';
             HELPER.version = h && h.version;
             HELPER.downloadDir = h && h.downloadDir;
             HELPER.tools = h && h.tools;
+            HELPER.lastError = null;
         } catch (e) {
             HELPER.alive = false;
+            HELPER.lastError = e && (e.body || e.status === 0 ? 'unreachable (helper not running or @connect blocked)' : `HTTP ${e.status}`);
+            // Surface in console too — the Settings panel only shows it
+            // after the user opens the dialog.
+            try { console.warn('[UVD] helper unreachable:', e); } catch (_) {}
         }
         // Reflect state on the FAB.
         const dot = document.querySelector('#uvd-fab .uvd-helper-dot');
@@ -1635,6 +1651,7 @@
                     ${HELPER.alive ? `running (v${HELPER.version || '?'})` : 'not running'}
                 </span></div>
                 ${HELPER.alive && HELPER.downloadDir ? `<div style="font-size:11px;color:#888;margin-top:6px;">Download dir: <code style="color:#c4b5fd;">${HELPER.downloadDir}</code></div>` : ''}
+                ${!HELPER.alive && HELPER.lastError ? `<div style="font-size:11px;color:#fca5a5;margin-top:6px;">Last error: ${HELPER.lastError}</div>` : ''}
                 <label for="uvd-token-input">Token (64 hex characters)</label>
                 <input type="password" id="uvd-token-input" value="${currentToken}" placeholder="paste from install.ps1 output…" autocomplete="off" spellcheck="false">
                 <div class="uvd-settings-info">

@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 
 _real_print = print  # capture before any further indirection
@@ -470,12 +470,22 @@ class Handler(BaseHTTPRequestHandler):
         # Echo the request origin if it's allowed, else "null" (browsers
         # will reject; intentional).
         allow_origin = origin if (origin and ALLOWED_ORIGIN_RE.match(origin)) else "null"
-        return {
+        headers = {
             "Access-Control-Allow-Origin": allow_origin,
             "Access-Control-Allow-Headers": "Content-Type, X-UVD-Token",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Vary": "Origin",
         }
+        # Chromium 130+ "Private Network Access": when a public-origin
+        # page (https://youtube.com) fetches a private-network address
+        # (127.0.0.1), the browser sends `Access-Control-Request-Private-
+        # Network: true` on the preflight. We must echo
+        # `Access-Control-Allow-Private-Network: true` or the connection
+        # is blocked before the actual request ever runs. Echoing only
+        # when the request asks keeps the response surface clean.
+        if self.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
+            headers["Access-Control-Allow-Private-Network"] = "true"
+        return headers
 
     def _send_json(self, status: int, body: dict) -> None:
         data = json.dumps(body).encode("utf-8")
