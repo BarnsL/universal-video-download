@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.8.1
+// @version      2.8.2
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -296,36 +296,59 @@
     }
 
     // Small persistent toggle in the top-right corner of episode pages.
-    // Clicking flips autonextEnabled() and updates the badge text.
-    // Visible only when we detect an episode pattern (so it stays out
-    // of the way on non-episode pages).
+    // v2.8.2 — split into TWO pills:
+    //   left  = "AUTO-NEXT ON/OFF" toggle (persists)
+    //   right = "Skip now" — fires the countdown immediately so the
+    //           user can move on without waiting for video.ended (the
+    //           usual fallback for cross-origin iframe players where
+    //           we have no way to know when the video actually ended).
     function maybeMountAutonextBadge() {
         if (!detectEpisodeContext()) return;
-        if (document.getElementById('uvd-autonext-badge')) return;
-        const badge = document.createElement('button');
-        badge.id = 'uvd-autonext-badge';
-        badge.title = 'Universal Video Download — Auto-next toggle';
-        const render = () => {
+        if (document.getElementById('uvd-autonext-wrap')) return;
+
+        const wrap = document.createElement('div');
+        wrap.id = 'uvd-autonext-wrap';
+        wrap.style.cssText = [
+            'position:fixed','top:96px','right:18px','z-index:2147483646',
+            'display:flex','gap:6px','align-items:center',
+            'font:600 11px ui-sans-serif, system-ui, sans-serif',
+            'letter-spacing:.05em',
+        ].join(';');
+
+        const toggle = document.createElement('button');
+        toggle.id = 'uvd-autonext-badge';
+        toggle.title = 'Universal Video Download — Auto-next toggle';
+
+        const skip = document.createElement('button');
+        skip.id = 'uvd-autonext-skip';
+        skip.title = 'Skip to next episode now (10s countdown)';
+
+        const baseStyle = [
+            'padding:6px 12px','border-radius:999px',
+            'cursor:pointer','border:1px solid',
+            'box-shadow:0 2px 8px rgba(0,0,0,.4)',
+            'display:flex','align-items:center','gap:6px',
+            'font:inherit',
+        ];
+
+        const renderToggle = () => {
             const on = autonextEnabled();
-            badge.style.cssText = [
-                'position:fixed','top:96px','right:18px','z-index:2147483646',
-                'padding:6px 12px','border-radius:999px',
-                'font:600 11px ui-sans-serif, system-ui, sans-serif',
-                'letter-spacing:.05em','cursor:pointer',
-                'border:1px solid', on ? 'border-color:#22c55e' : 'border-color:#444',
+            toggle.style.cssText = baseStyle.concat([
+                on ? 'border-color:#22c55e' : 'border-color:#444',
                 'background:' + (on ? '#14532d' : '#1a1a1c'),
                 'color:' + (on ? '#bbf7d0' : '#aaa'),
-                'box-shadow:0 2px 8px rgba(0,0,0,.4)',
-                'display:flex','align-items:center','gap:6px',
-            ].join(';');
-            badge.textContent = on ? '⏭ AUTO-NEXT ON' : '⏸ AUTO-NEXT OFF';
+            ]).join(';');
+            toggle.textContent = on ? '⏭ AUTO-NEXT ON' : '⏸ AUTO-NEXT OFF';
         };
-        badge.addEventListener('click', () => {
+        skip.style.cssText = baseStyle.concat([
+            'border-color:#6366f1', 'background:#1e1b4b', 'color:#c7d2fe',
+        ]).join(';');
+        skip.textContent = '⏩ Skip now';
+
+        toggle.addEventListener('click', () => {
             setAutonextEnabled(!autonextEnabled());
-            render();
+            renderToggle();
             if (autonextEnabled()) {
-                // Immediate confirmation toast: where the next jump
-                // will land if/when armed.
                 const url = nextEpisodeUrl();
                 if (url) console.info('[UVD] auto-next armed →', url);
                 wireAutonextWatcher();
@@ -333,22 +356,40 @@
                 cancelAutonextCountdown();
             }
         });
-        document.body.appendChild(badge);
-        render();
+
+        skip.addEventListener('click', () => {
+            const url = nextEpisodeUrl();
+            if (!url) {
+                alert('Could not derive the next-episode URL from this page.');
+                return;
+            }
+            startAutonextCountdown(url);
+        });
+
+        wrap.appendChild(toggle);
+        wrap.appendChild(skip);
+        document.body.appendChild(wrap);
+        renderToggle();
     }
 
-    // Try to listen for "video ended" on any in-page <video> element.
-    // For cross-origin iframes (wcostream, kwik, etc.) this won't reach
-    // inside, so the badge becomes click-to-arm + manual "Next episode"
-    // trigger from the dialog. Same compromise the mikutellyourworld
-    // script makes — it runs in BOTH origins (animepahe + kwik) via
-    // separate @match lines, and uses postMessage between them. We
-    // don't have a foothold inside Kwik or wcostream's embed.
+    // v2.8.2 — Three independent triggers, race to fire startAutonextCountdown:
+    //   A. <video>.ended on any in-page video (works for parent-page players)
+    //   B. window.message handler that recognises common
+    //      end-of-video payloads broadcast by embed players
+    //      (postMessage event names like 'video.ended', 'ended', 'finish',
+    //      'complete', 'PLAYER_STATE_CHANGED' / state:0). Reaches into
+    //      cross-origin iframes without breaking their CSP — the iframe
+    //      just has to be configured to broadcast, which most modern
+    //      players do.
+    //   C. Manual "Skip now" button on the corner badge — guaranteed
+    //      to work even when A and B don't.
     let _autoNextWired = false;
     function wireAutonextWatcher() {
         if (_autoNextWired) return;
         _autoNextWired = true;
-        const tryWire = () => {
+
+        // (A) <video>.ended on any current or future in-page <video>
+        const tryWireVideos = () => {
             const videos = document.querySelectorAll('video');
             for (const v of videos) {
                 if (v.__uvdAutoNextWired) continue;
@@ -360,10 +401,43 @@
                 });
             }
         };
-        tryWire();
-        // Some sites mount the <video> after navigation/player init —
-        // re-poke every few seconds while autonext is on.
-        setInterval(() => { if (autonextEnabled()) tryWire(); }, 3000);
+        tryWireVideos();
+        setInterval(() => { if (autonextEnabled()) tryWireVideos(); }, 3000);
+
+        // (B) postMessage listener. We watch for the patterns common
+        // to JWPlayer, Plyr, Video.js, YouTube-style and bespoke embed
+        // players. Loose matcher — better to over-fire and let the
+        // countdown's Cancel button save the user than to miss it.
+        const ENDED_HINTS = /\b(?:ended|finish|complete|onended|video[_-]?end|playback[_-]?end|state[_-]?changed)\b/i;
+        const ENDED_STATE_RE = /state\s*[:=]\s*(?:'?ended'?|0)/i;
+        window.addEventListener('message', (ev) => {
+            if (!autonextEnabled()) return;
+            let payload = ev.data;
+            try {
+                if (typeof payload === 'string') {
+                    if (ENDED_HINTS.test(payload) || /["']ended["']/i.test(payload)) {
+                        const url = nextEpisodeUrl();
+                        if (url) startAutonextCountdown(url);
+                        return;
+                    }
+                    try { payload = JSON.parse(payload); } catch (_) {}
+                }
+                if (payload && typeof payload === 'object') {
+                    const keys = Object.keys(payload).join(' ');
+                    const str = JSON.stringify(payload);
+                    if (
+                        ENDED_HINTS.test(keys) ||
+                        ENDED_HINTS.test(payload.event || payload.type || payload.name || '') ||
+                        ENDED_STATE_RE.test(str) ||
+                        payload.ended === true || payload.complete === true ||
+                        payload.playerState === 0 // YT/HTML5-ish
+                    ) {
+                        const url = nextEpisodeUrl();
+                        if (url) startAutonextCountdown(url);
+                    }
+                }
+            } catch (_) {}
+        }, { passive: true });
     }
 
     // Queue the next K episodes through the helper. Used by the
