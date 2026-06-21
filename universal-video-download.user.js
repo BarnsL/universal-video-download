@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.3.1
+// @version      2.4
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -1187,7 +1187,7 @@
                 const badges = [];
                 if (s.fps > 30) badges.push(`<span class="uvd-badge uvd-badge-hfr">${s.fps}fps</span>`);
                 html += `
-                    <li class="uvd-stream-item" data-url="${s.url || ''}" data-ext="${ext}" data-type="video">
+                    <li class="uvd-stream-item" data-url="${s.url || ''}" data-itag="${s.itag || ''}" data-ext="${ext}" data-type="video">
                         <span class="uvd-col-quality">${s.quality || 'Original'}</span>
                         <span class="uvd-col-format">${s.container || ext.toUpperCase()}</span>
                         <span class="uvd-col-codec">${s.codec || ''}</span>
@@ -1207,7 +1207,7 @@
                 if (s.fps > 30) badges.push(`<span class="uvd-badge uvd-badge-hfr">${s.fps}fps</span>`);
                 if (s.hdr) badges.push(`<span class="uvd-badge uvd-badge-hdr">HDR</span>`);
                 html += `
-                    <li class="uvd-stream-item" data-url="${s.url || ''}" data-ext="${ext}" data-type="video-only">
+                    <li class="uvd-stream-item" data-url="${s.url || ''}" data-itag="${s.itag || ''}" data-ext="${ext}" data-type="video-only">
                         <span class="uvd-col-quality">${s.quality}</span>
                         <span class="uvd-col-format">${s.container}</span>
                         <span class="uvd-col-codec">${s.codec}</span>
@@ -1259,7 +1259,7 @@
             if (s.loudnessDb) extras.push(`${s.loudnessDb.toFixed(1)}dB`);
 
             html += `
-                <li class="uvd-stream-item" data-url="${s.url || ''}" data-ext="${ext}" data-type="audio" data-track="${s.audioTrackId || 'default'}">
+                <li class="uvd-stream-item" data-url="${s.url || ''}" data-itag="${s.itag || ''}" data-ext="${ext}" data-type="audio" data-track="${s.audioTrackId || 'default'}">
                     <span class="uvd-col-quality">${s.quality}</span>
                     <span class="uvd-col-format">${s.container}</span>
                     <span class="uvd-col-codec">${s.codec}</span>
@@ -1355,10 +1355,37 @@
     function performDownload(selectedItem, overlay) {
         const url = selectedItem.dataset.url;
         const ext = selectedItem.dataset.ext || 'mp4';
+        const itag = selectedItem.dataset.itag || '';
+        const type = selectedItem.dataset.type || '';
         const filename = overlay.querySelector('#uvd-filename').value || 'download';
         const fullFilename = `${sanitizeFilename(filename)}.${ext}`;
 
         if (!url) {
+            // BUG-004 fallback: YouTube's modern DASH streams ship a
+            // `signatureCipher` blob instead of a plain `url`, and decoding it
+            // requires the per-version JS player's `n`/`sig` deobfuscation
+            // functions — far out of scope for a single-file userscript. The
+            // best a userscript can do here is hand off to yt-dlp, which does
+            // implement the decoder. We build a ready-to-run command and copy
+            // it to the clipboard so the user just has to paste it into a
+            // shell. itag was added to the stream items in v2.4 specifically
+            // to make this handoff one-click.
+            if (itag && CONFIG.supportedSites.youtube.test(location.hostname)) {
+                const watchUrl = location.href.split('&')[0]; // strip &list= / &t= so yt-dlp sees a clean URL
+                // Video-only adaptive streams need to be merged with bestaudio
+                // to be useful; everything else (progressive, audio-only,
+                // subtitles) is fine with the raw itag.
+                const fmt = type === 'video-only' ? `${itag}+bestaudio` : itag;
+                const merge = type === 'video-only' ? ' --merge-output-format mp4' : '';
+                const cmd = `yt-dlp -f ${fmt}${merge} "${watchUrl}" -o "${fullFilename}"`;
+                navigator.clipboard.writeText(cmd).then(() => {
+                    alert(`This YouTube stream is signature-encrypted — direct download isn't possible from the browser.\n\nA ready-to-run yt-dlp command has been copied to your clipboard:\n\n${cmd}\n\nPaste it into PowerShell or a terminal. Requires yt-dlp installed (winget install yt-dlp).`);
+                }, () => {
+                    // Clipboard write blocked (rare; some CSPs do this).
+                    prompt('Copy this yt-dlp command and run it in a terminal:', cmd);
+                });
+                return;
+            }
             alert('No direct download URL available.\n\nThis stream may be:\n• DRM protected\n• Using blob/MediaSource (not directly downloadable)\n• Signature-encrypted (YouTube DASH)\n\nTry "Copy URL" and use yt-dlp or another tool.');
             return;
         }

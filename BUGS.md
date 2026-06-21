@@ -176,6 +176,55 @@ We could rewrite the dialog as `createElement` + `appendChild`, but the dialog t
 
 ---
 
+## BUG-004: YouTube DASH streams are signature-encrypted; no direct download from the browser
+
+**Reported:** 2026-06-21
+**Mitigated:** 2026-06-21 (v2.4)
+**Status:** MITIGATED (full fix is fundamentally out of scope — see below)
+**Severity:** Functional gap (the script detects streams but can't save them)
+**Affected function:** `performDownload()`, `extractCipherUrl()`
+
+### Symptom
+After v2.3 fixed Trusted Types and the dialog opens correctly on YouTube, clicking **Download** on most adaptive video or audio streams hits an alert that reads *"No direct download URL available."* The stream is detected and listed, but pressing Download does nothing useful.
+
+### Root cause
+Modern YouTube ships adaptive streams (the `adaptiveFormats` array in the player response) without a plain `url` field. Instead, each format object contains either:
+
+- `signatureCipher`: a URL-encoded blob containing `s` (an encrypted signature), `sp` (the query-param name to put the decrypted signature into, usually `sig` or `sig2`), and `url` (the base URL).
+- A plain `url` that is *almost* playable but whose query string contains an `n` parameter that has been throttled. Requests with the original `n` succeed at a few hundred KB/s; requests with a deobfuscated `n` succeed at full speed.
+
+To produce a working download URL the script would have to:
+
+1. Fetch YouTube's per-version JS player (`base.js`).
+2. Parse it to locate the `s`-decryption function (usually a chain of array reverses, splices, and swaps) and the `n`-deobfuscation function (a much hairier JS expression).
+3. Re-implement both in the userscript's sandbox and apply them to each format.
+
+yt-dlp does exactly this, and the extractor breaks every few weeks when YouTube ships a new player version. Tracking it from a single-file userscript is not realistic.
+
+`extractCipherUrl()` in the script does the easy part — `URLSearchParams(cipher).get('url')` — but the `url` it returns is the *base* URL with no signature appended, so playback servers reject it. The function returns an empty string in practice on modern YouTube.
+
+### Mitigation (v2.4)
+Instead of dead-ending with a useless alert when `url` is empty, the script now builds a ready-to-run `yt-dlp` command using the stream's `itag` plus the current watch URL, copies it to the clipboard, and tells the user to paste it into a terminal.
+
+- Added `data-itag="..."` to the four stream-item template literals so the itag survives into the DOM where `performDownload()` can read it.
+- In `performDownload()`, the no-URL branch now:
+  - Strips `&list=…` / `&t=…` etc. off the current URL so yt-dlp sees a clean watch URL.
+  - For `video-only` adaptive streams, formats as `-f <itag>+bestaudio --merge-output-format mp4` (so the user actually ends up with playable video, not silent video).
+  - For progressive / audio / subtitle types, just `-f <itag>`.
+  - Pipes the command through `navigator.clipboard.writeText`; falls back to `prompt()` if clipboard is blocked.
+- The alert tells the user it's been copied and points at `winget install yt-dlp` for setup.
+
+### Why this is the right ceiling
+- yt-dlp is the canonical, maintained, frequently-updated implementation of YouTube extraction. Re-implementing a subset of it in this script would create a second thing that breaks every few weeks.
+- The userscript is most valuable on non-YouTube sites where direct download via `<video>`, `<source>`, or intercepted manifests Just Works. For YouTube it's a sophisticated detector + a one-click handoff.
+- If you do want to attempt cipher decryption later, look at the `_decipher` and `_descramble_n` helpers in `yt_dlp/extractor/youtube/_video.py` — they're the canonical reference.
+
+### Notes for users
+- Once `yt-dlp` is installed, the entire workflow is: click Download → paste in PowerShell → file lands in your CWD.
+- If `yt-dlp -U` reports the extractor is broken on a given day, that's YouTube changing things; wait for the next yt-dlp release. The userscript does not need to be re-installed.
+
+---
+
 ## Notes
 
 - Both bugs are in the single file `universal-video-download.user.js`
