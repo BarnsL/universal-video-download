@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.5.2
+// @version      2.5.3
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -1699,11 +1699,21 @@
         if (!badge) return;
         badge.classList.toggle('alive', !!HELPER.alive);
         badge.classList.toggle('absent', !HELPER.alive);
-        // Replace text node (keep the dot span as first child).
-        const textNodes = [...badge.childNodes].filter(n => n.nodeType === Node.TEXT_NODE);
-        const label = HELPER.alive ? 'helper running' : 'no helper';
-        if (textNodes.length) textNodes[0].nodeValue = ' ' + label;
-        else badge.appendChild(document.createTextNode(' ' + label));
+        // Rebuild the badge content cleanly. The template-literal source
+        // produces leading whitespace text nodes that earlier versions
+        // mistook for the label node — replacing the wrong one left the
+        // real "helper running" text behind and the badge rendered
+        // "helper running • helper running". Wipe and re-append the dot
+        // + one fresh label node.
+        const dot = badge.querySelector('.uvd-helper-badge-dot');
+        badge.textContent = '';
+        if (dot) badge.appendChild(dot);
+        else {
+            const fresh = document.createElement('span');
+            fresh.className = 'uvd-helper-badge-dot';
+            badge.appendChild(fresh);
+        }
+        badge.appendChild(document.createTextNode(' ' + (HELPER.alive ? 'helper running' : 'no helper')));
     }
 
     // Progress overlay (replaces the dialog body when a helper job is
