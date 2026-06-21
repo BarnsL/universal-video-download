@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.7.2
+// @version      2.8.0
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -161,6 +161,236 @@
     }
     async function helperOpenDownloadDir() {
         return gmFetch('POST', '/open-download-dir', {});
+    }
+
+    // ==================== AUTO-NEXT + EPISODE DISCOVERY (v2.8.0) ====================
+    //
+    // Adapted from mikutellyourworld/AnimePahe-Streaming-Autoplay-Fix-
+    // TamperMonkey-Script (animepahe-autonext-v2.user.js). The original
+    // is animepahe-specific; this version is URL-pattern based so it
+    // works on wcoanimedub.tv (e.g. .../my-dress-up-darling-episode-7-
+    // english-dubbed → .../my-dress-up-darling-episode-8-english-dubbed)
+    // and any other site whose episode pages contain a `-episode-N-`
+    // segment.
+    //
+    // Two features ride on the same detector:
+    //   1. "▶ Next episode" navigation (+ optional countdown auto-nav)
+    //   2. "📥 Queue next N episodes via yt-dlp" — for the downloader
+    //      use case, send N+1..N+K to the helper /download endpoint so
+    //      the helper grabs them in the background.
+    const AUTONEXT_ENABLED_KEY = 'uvd_autonext_enabled';
+    const AUTONEXT_COUNTDOWN_SECONDS = 10;
+    // -episode-<digits> with an optional trailing word ("-english-dubbed", "-sub", "-raw")
+    const EPISODE_RE = /-episode-(\d+)((?:-[a-z0-9]+)*)(?=\/|$|\?|#)/i;
+
+    function detectEpisodeContext() {
+        const m = location.pathname.match(EPISODE_RE);
+        if (!m) return null;
+        const current = parseInt(m[1], 10);
+        if (!Number.isFinite(current) || current < 0) return null;
+        return { current, tail: m[2] || '' };
+    }
+
+    function buildEpisodeUrl(n) {
+        const ctx = detectEpisodeContext();
+        if (!ctx) return null;
+        const newPath = location.pathname.replace(EPISODE_RE,
+            (_full, _num, tail) => `-episode-${n}${tail || ''}`);
+        return location.origin + newPath + location.search;
+    }
+
+    // Find an explicit "next episode" anchor in the DOM. Pattern
+    // borrowed from the mikutellyourworld script — first try a
+    // title-attributed link, then any anchor whose own href matches
+    // -episode-(N+1)-.
+    function findNextEpisodeLink() {
+        const explicit = document.querySelector(
+            'a[title*="Next" i][title*="Episode" i], a[title="Play Next Episode"]'
+        );
+        if (explicit && explicit.href) return explicit.href;
+
+        const ctx = detectEpisodeContext();
+        if (!ctx) return null;
+        const wantN = ctx.current + 1;
+        const candidates = Array.from(document.querySelectorAll('a[href]'));
+        for (const a of candidates) {
+            const m = (a.getAttribute('href') || a.href || '').match(EPISODE_RE);
+            if (m && parseInt(m[1], 10) === wantN) return a.href;
+        }
+        return null;
+    }
+
+    function nextEpisodeUrl() {
+        return findNextEpisodeLink() || buildEpisodeUrl(
+            (detectEpisodeContext()?.current ?? -1) + 1
+        );
+    }
+
+    function autonextEnabled() {
+        try { return !!GM_getValue(AUTONEXT_ENABLED_KEY, false); }
+        catch (e) { return false; }
+    }
+    function setAutonextEnabled(v) {
+        try { GM_setValue(AUTONEXT_ENABLED_KEY, !!v); } catch (e) {}
+    }
+
+    // Countdown toast — directly modeled on the animepahe-autonext
+    // showCountdown() function. Cancellable; on zero, navigates.
+    let _autoNextCountdownTimer = null;
+    function startAutonextCountdown(targetUrl) {
+        cancelAutonextCountdown();
+        if (!targetUrl) return;
+
+        const toast = document.createElement('div');
+        toast.id = 'uvd-autonext-toast';
+        toast.style.cssText = [
+            'position:fixed','bottom:88px','right:24px','z-index:2147483647',
+            'background:rgba(15,15,25,.95)','color:#fff',
+            'padding:14px 20px','border-radius:10px',
+            'font:bold 14px ui-sans-serif, system-ui, -apple-system, sans-serif',
+            'box-shadow:0 4px 24px rgba(0,0,0,.6)',
+            'display:flex','flex-direction:column','gap:8px',
+            'min-width:240px','border:1px solid rgba(99,102,241,.5)',
+        ].join(';');
+
+        let remaining = AUTONEXT_COUNTDOWN_SECONDS;
+        const label = document.createElement('span');
+        label.style.fontSize = '15px';
+        label.textContent = `▶ Next episode in ${remaining}s…`;
+        toast.appendChild(label);
+
+        const sub = document.createElement('span');
+        sub.style.cssText = 'font-size:11px;color:#a5b4fc;word-break:break-all;font-weight:400;';
+        sub.textContent = targetUrl;
+        toast.appendChild(sub);
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = [
+            'background:#d43','color:#fff','border:none','border-radius:5px',
+            'padding:5px 14px','cursor:pointer','font-size:13px',
+            'font-weight:bold','align-self:flex-end',
+        ].join(';');
+        cancelBtn.addEventListener('click', () => cancelAutonextCountdown());
+        toast.appendChild(cancelBtn);
+
+        document.body.appendChild(toast);
+
+        _autoNextCountdownTimer = setInterval(() => {
+            remaining -= 1;
+            label.textContent = `▶ Next episode in ${remaining}s…`;
+            if (remaining <= 0) {
+                cancelAutonextCountdown();
+                try { location.href = targetUrl; } catch (e) {}
+            }
+        }, 1000);
+    }
+
+    function cancelAutonextCountdown() {
+        if (_autoNextCountdownTimer) {
+            clearInterval(_autoNextCountdownTimer);
+            _autoNextCountdownTimer = null;
+        }
+        const t = document.getElementById('uvd-autonext-toast');
+        if (t) t.remove();
+    }
+
+    // Small persistent toggle in the top-right corner of episode pages.
+    // Clicking flips autonextEnabled() and updates the badge text.
+    // Visible only when we detect an episode pattern (so it stays out
+    // of the way on non-episode pages).
+    function maybeMountAutonextBadge() {
+        if (!detectEpisodeContext()) return;
+        if (document.getElementById('uvd-autonext-badge')) return;
+        const badge = document.createElement('button');
+        badge.id = 'uvd-autonext-badge';
+        badge.title = 'Universal Video Download — Auto-next toggle';
+        const render = () => {
+            const on = autonextEnabled();
+            badge.style.cssText = [
+                'position:fixed','top:96px','right:18px','z-index:2147483646',
+                'padding:6px 12px','border-radius:999px',
+                'font:600 11px ui-sans-serif, system-ui, sans-serif',
+                'letter-spacing:.05em','cursor:pointer',
+                'border:1px solid', on ? 'border-color:#22c55e' : 'border-color:#444',
+                'background:' + (on ? '#14532d' : '#1a1a1c'),
+                'color:' + (on ? '#bbf7d0' : '#aaa'),
+                'box-shadow:0 2px 8px rgba(0,0,0,.4)',
+                'display:flex','align-items:center','gap:6px',
+            ].join(';');
+            badge.textContent = on ? '⏭ AUTO-NEXT ON' : '⏸ AUTO-NEXT OFF';
+        };
+        badge.addEventListener('click', () => {
+            setAutonextEnabled(!autonextEnabled());
+            render();
+            if (autonextEnabled()) {
+                // Immediate confirmation toast: where the next jump
+                // will land if/when armed.
+                const url = nextEpisodeUrl();
+                if (url) console.info('[UVD] auto-next armed →', url);
+                wireAutonextWatcher();
+            } else {
+                cancelAutonextCountdown();
+            }
+        });
+        document.body.appendChild(badge);
+        render();
+    }
+
+    // Try to listen for "video ended" on any in-page <video> element.
+    // For cross-origin iframes (wcostream, kwik, etc.) this won't reach
+    // inside, so the badge becomes click-to-arm + manual "Next episode"
+    // trigger from the dialog. Same compromise the mikutellyourworld
+    // script makes — it runs in BOTH origins (animepahe + kwik) via
+    // separate @match lines, and uses postMessage between them. We
+    // don't have a foothold inside Kwik or wcostream's embed.
+    let _autoNextWired = false;
+    function wireAutonextWatcher() {
+        if (_autoNextWired) return;
+        _autoNextWired = true;
+        const tryWire = () => {
+            const videos = document.querySelectorAll('video');
+            for (const v of videos) {
+                if (v.__uvdAutoNextWired) continue;
+                v.__uvdAutoNextWired = true;
+                v.addEventListener('ended', () => {
+                    if (!autonextEnabled()) return;
+                    const url = nextEpisodeUrl();
+                    if (url) startAutonextCountdown(url);
+                });
+            }
+        };
+        tryWire();
+        // Some sites mount the <video> after navigation/player init —
+        // re-poke every few seconds while autonext is on.
+        setInterval(() => { if (autonextEnabled()) tryWire(); }, 3000);
+    }
+
+    // Queue the next K episodes through the helper. Used by the
+    // "📥 Queue next N" button in the dialog when the helper is alive.
+    async function queueNextEpisodes(k) {
+        const ctx = detectEpisodeContext();
+        if (!ctx) return { queued: 0, error: 'no episode pattern in URL' };
+        const titleBase = (document.title || location.hostname).replace(/episode\s*\d+/i, '').trim();
+        const results = [];
+        for (let i = 1; i <= k; i++) {
+            const n = ctx.current + i;
+            const u = buildEpisodeUrl(n);
+            if (!u) continue;
+            const payload = {
+                url: u,
+                type: 'video',
+                ext: 'mp4',
+                filename: sanitizeFilename(`${titleBase} - Episode ${n}`),
+            };
+            try {
+                const job = await helperStartDownload(payload);
+                results.push(job && job.id);
+            } catch (e) {
+                results.push(null);
+            }
+        }
+        return { queued: results.filter(Boolean).length, total: k };
     }
 
     // ==================== CONFIGURATION ====================
@@ -1741,6 +1971,21 @@
                             </p>
                             <button class="uvd-btn uvd-btn-primary" id="uvd-try-ytdlp">▶ Queue this page in yt-dlp</button>
                         </div>` : ''}
+                        ${detectEpisodeContext() ? `
+                        <div style="background:#1a1a1c;border:1px solid #2a2a2f;border-radius:8px;padding:14px;margin-bottom:18px;">
+                            <p style="font-size:13px;color:#ddd;margin:0 0 10px 0;line-height:1.5;">
+                                <strong>This looks like Episode ${detectEpisodeContext().current}.</strong>
+                                ${nextEpisodeUrl() ? `Next episode auto-detected.` : `No next-episode link found in the DOM, but URL pattern lets us build one.`}
+                            </p>
+                            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                <button class="uvd-btn uvd-btn-secondary" id="uvd-go-next-ep">▶ Open Episode ${detectEpisodeContext().current + 1}</button>
+                                ${HELPER.alive && helperGetToken() ? `
+                                <button class="uvd-btn uvd-btn-secondary" id="uvd-queue-next-5">📥 Queue next 5 via yt-dlp</button>
+                                <button class="uvd-btn uvd-btn-secondary" id="uvd-queue-next-12">📥 Queue next 12</button>
+                                ` : ''}
+                                <button class="uvd-btn uvd-btn-secondary" id="uvd-toggle-autonext">${autonextEnabled() ? '⏸ Disable Auto-next' : '⏭ Enable Auto-next'}</button>
+                            </div>
+                        </div>` : ''}
                         <p style="font-size:13px;color:#888;line-height:1.6;">
                             <strong>Tips:</strong><br>
                             • Make sure the video has started playing<br>
@@ -1779,6 +2024,41 @@
         // etc.) that the userscript's in-page scan can't see.
         overlay.querySelector('#uvd-try-ytdlp')?.addEventListener('click', () => {
             queuePageThroughHelper(overlay);
+        });
+        // v2.8.0 — episode navigation + queue-next-N + autonext toggle.
+        overlay.querySelector('#uvd-go-next-ep')?.addEventListener('click', () => {
+            const url = nextEpisodeUrl();
+            if (!url) { alert('Could not derive a next-episode URL from this page.'); return; }
+            location.href = url;
+        });
+        const queueNHandler = async (n) => {
+            const btn = overlay.querySelector(`#uvd-queue-next-${n}`);
+            if (!btn) return;
+            const prev = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = `Queueing ${n}…`;
+            try {
+                const r = await queueNextEpisodes(n);
+                btn.textContent = `✅ Queued ${r.queued}/${r.total}`;
+                pollQueueOnce(overlay);
+                setTimeout(() => openQueuePanel(overlay), 600);
+            } catch (e) {
+                btn.textContent = '⚠ Helper failed';
+                setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 2200);
+            }
+        };
+        overlay.querySelector('#uvd-queue-next-5')?.addEventListener('click', () => queueNHandler(5));
+        overlay.querySelector('#uvd-queue-next-12')?.addEventListener('click', () => queueNHandler(12));
+        overlay.querySelector('#uvd-toggle-autonext')?.addEventListener('click', (e) => {
+            setAutonextEnabled(!autonextEnabled());
+            const on = autonextEnabled();
+            e.currentTarget.textContent = on ? '⏸ Disable Auto-next' : '⏭ Enable Auto-next';
+            // Re-mount the corner badge so its color/state matches.
+            const existing = document.getElementById('uvd-autonext-badge');
+            if (existing) existing.remove();
+            maybeMountAutonextBadge();
+            if (on) wireAutonextWatcher();
+            else cancelAutonextCountdown();
         });
         document.addEventListener('keydown', escHandler);
     }
@@ -2670,6 +2950,14 @@
     // user even opens the dialog. We re-probe each time the dialog
     // opens too — see showDialog().
     detectHelper();
+
+    // v2.8.0 — mount the autonext badge on any page whose URL matches
+    // the `-episode-N-` pattern. Badge starts visible (off by default)
+    // so the user can flip it on without opening the dialog.
+    setTimeout(() => {
+        maybeMountAutonextBadge();
+        if (autonextEnabled()) wireAutonextWatcher();
+    }, 1500);
 
     // Initial scan
     setTimeout(() => {
