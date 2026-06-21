@@ -67,6 +67,37 @@ def config_dir() -> Path:
     return base / "uvd-helper"
 
 
+def pick_writable_download_dir() -> str:
+    """Find the first writable candidate for the default download dir.
+
+    On Windows, Path.home() / "Downloads" is often a Junction redirected
+    to a moved drive; if the target is gone the join fails with
+    `WinError 3 (path not found)` even though the junction itself reports
+    is_dir()=True via `Get-Item`. The walk-and-test loop here picks the
+    first candidate whose `makedirs` actually succeeds, so the helper
+    never gets stuck pointing at a phantom path.
+    """
+    candidates = [
+        Path.home() / "Downloads" / "uvd",
+        Path.home() / "Videos" / "uvd",
+        Path.home() / "uvd-downloads",
+    ]
+    for c in candidates:
+        try:
+            os.makedirs(str(c), exist_ok=True)
+            if c.is_dir():
+                return str(c)
+        except OSError:
+            continue
+    # Truly nothing writable in the home tree — fall back to the temp
+    # dir, which always exists. Worth surfacing in /health so the UI can
+    # flag it.
+    import tempfile
+    fallback = Path(tempfile.gettempdir()) / "uvd"
+    os.makedirs(str(fallback), exist_ok=True)
+    return str(fallback)
+
+
 def load_or_init_config() -> dict:
     cfg_dir = config_dir()
     cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -77,7 +108,19 @@ def load_or_init_config() -> dict:
             # Backfill missing keys when older configs exist.
             cfg.setdefault("token", secrets.token_hex(32))
             cfg.setdefault("port", DEFAULT_PORT)
-            cfg.setdefault("downloadDir", str(Path.home() / "Downloads" / "uvd"))
+            # If a previous config recorded a path that no longer works
+            # (e.g. broken Downloads junction), re-pick. Don't trash a
+            # user-edited valid path.
+            existing = cfg.get("downloadDir")
+            if not existing:
+                cfg["downloadDir"] = pick_writable_download_dir()
+            else:
+                try:
+                    os.makedirs(existing, exist_ok=True)
+                    if not Path(existing).is_dir():
+                        cfg["downloadDir"] = pick_writable_download_dir()
+                except OSError:
+                    cfg["downloadDir"] = pick_writable_download_dir()
             cfg_file.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
             return cfg
         except Exception as e:
@@ -85,7 +128,7 @@ def load_or_init_config() -> dict:
     cfg = {
         "token": secrets.token_hex(32),
         "port": DEFAULT_PORT,
-        "downloadDir": str(Path.home() / "Downloads" / "uvd"),
+        "downloadDir": pick_writable_download_dir(),
     }
     cfg_file.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     # Lock down on POSIX so other users can't read the token.
@@ -187,7 +230,30 @@ JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
 CONFIG = load_or_init_config()
 DOWNLOAD_DIR = Path(CONFIG["downloadDir"])
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_dir(p: Path) -> None:
+    """mkdir(parents=True, exist_ok=True), but tolerant of junctions /
+    reparse points on Windows. Some user home folders (Downloads, Documents
+    on OneDrive-managed accounts) are Junction targets; pathlib 3.12's
+    `parents=True` walk can trip on them by hitting an OSError whose
+    `is_dir()` re-check trusts the junction differently than os.mkdir does.
+    Falling back to a direct os.makedirs + is_dir() check works around it.
+    """
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return
+    except OSError:
+        pass
+    try:
+        os.makedirs(str(p), exist_ok=True)
+    except OSError:
+        pass
+    if not p.is_dir():
+        raise OSError(f"could not create or access {p}")
+
+
+ensure_dir(DOWNLOAD_DIR)
 
 
 def evict_old_jobs() -> None:

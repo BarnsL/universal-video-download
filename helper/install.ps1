@@ -1,4 +1,4 @@
-# install.ps1 — Install uvd-helper on Windows.
+# install.ps1 -- Install uvd-helper on Windows.
 #
 # What this does:
 #   1. Ensures Python 3.10+ + yt-dlp + ffmpeg are installed (winget).
@@ -101,7 +101,7 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Se
 Write-Host "    Scheduled task '$TaskName' registered (auto-starts at login)."
 
 # 6. Start it now. If something else is already bound to the port, this
-#    will fail silently — we surface it in the health check below.
+#    will fail silently -- we surface it in the health check below.
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 2
 
@@ -125,7 +125,8 @@ Write-Host "  $token" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Next step: open any tab where the userscript runs (e.g. youtube.com),"
 Write-Host "open the download dialog (Ctrl+Shift+D), click the gear icon, and"
-Write-Host "paste the token. After that, Download just works — no clipboard"
+Write-Host "paste the token. After that, Download just works -- no clipboard"
 Write-Host "round-trip, no terminal."
 Write-Host ""
-Write-Host "Uninstall:  Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false; Remove-Item -Recurse '$InstallDir'"
+$uninst = "Unregister-ScheduledTask -TaskName " + $TaskName + ' -Confirm:$false; Remove-Item -Recurse "' + $InstallDir + '"'
+Write-Host "Uninstall:  $uninst"
