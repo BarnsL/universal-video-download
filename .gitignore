@@ -1,3 +1,8 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+
 # OS / Editor cruft
 .DS_Store
 Thumbs.db
