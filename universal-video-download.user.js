@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.3.1
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
+// @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
+// @downloadURL  https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_addStyle
