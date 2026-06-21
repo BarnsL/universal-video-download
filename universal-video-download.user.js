@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.7.0
+// @version      2.7.1
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -2379,6 +2379,14 @@
         // bounded by querySelectorAll on 3 tag names) and idempotent.
         if (!document.getElementById('uvd-site-btn')) injectGenericSiteButton();
 
+        // v2.7.1 — if the inline companion button is in place, don't
+        // re-show the FAB. The inline button is enough, and the FAB
+        // tends to sit on top of player controls at the viewport corner.
+        if (document.getElementById('uvd-site-btn')) {
+            hideFab();
+            return;
+        }
+
         if (hasVideo) {
             showFab();
         }
@@ -2447,28 +2455,25 @@
         setHTML(btn, `<svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> Download via UVD`);
         btn.addEventListener('click', () => showDialog());
 
-        // Place directly after the site's download button. If the
-        // parent is inline / inline-flex, wrap so we appear underneath.
+        // Place directly after the site's download button, in a
+        // block-level wrapper so we appear underneath rather than
+        // beside, and centered horizontally inside that wrapper.
         const parent = target.el.parentElement;
         if (!parent) return;
-        const parentDisplay = (getComputedStyle(parent).display || '').toLowerCase();
-        if (parentDisplay.startsWith('inline') || parentDisplay === 'flex') {
-            // Wrap in a block to force a newline under the existing button.
-            const wrap = document.createElement('div');
-            wrap.style.cssText = 'display:block;margin:6px 0 0 0;';
-            wrap.appendChild(btn);
-            if (target.el.nextSibling) {
-                parent.insertBefore(wrap, target.el.nextSibling);
-            } else {
-                parent.appendChild(wrap);
-            }
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:block;margin:8px 0 0 0;text-align:center;width:100%;';
+        wrap.appendChild(btn);
+        if (target.el.nextSibling) {
+            parent.insertBefore(wrap, target.el.nextSibling);
         } else {
-            if (target.el.nextSibling) {
-                parent.insertBefore(btn, target.el.nextSibling);
-            } else {
-                parent.appendChild(btn);
-            }
+            parent.appendChild(wrap);
         }
+
+        // v2.7.1 — once we've successfully injected the inline
+        // companion, the FAB is redundant. Drop it so it doesn't sit
+        // on top of the video controls (animepahe / Kwik / generic
+        // players all have controls at the bottom-right).
+        hideFab();
     }
 
     // Also inject an inline button on YouTube. YouTube renames their
