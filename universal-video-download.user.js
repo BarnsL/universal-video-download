@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.8.5
+// @version      2.8.6
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -2688,8 +2688,14 @@
     }
 
     function showFab() {
-        const fab = document.getElementById('uvd-fab');
-        if (fab) fab.classList.add('visible');
+        // v2.8.6 — disabled globally. The corner-circle FAB was
+        // redundant once we have the inline 'Download' pill in the
+        // action bar (or under the next-episode link, on sites that
+        // don't have one). Ctrl+Shift+D still opens the dialog from
+        // anywhere. createFab() still runs so the badge / status dot
+        // logic compiles, but the FAB stays opacity:0/pointer-events
+        // :none — it just never gets the .visible class.
+        return;
     }
 
     function hideFab() {
@@ -2969,23 +2975,10 @@
         opts = opts || {};
         const align = opts.align || 'center';  // 'center' | 'inherit'
 
-        // v2.8.5 — match YouTube's native action-bar pill style. The
-        // earlier saturated-blue gradient stood out way too much next
-        // to subdued site UI (animepahe, wcoanimedub, etc.). Detect a
-        // dark vs light page background and pick a translucent fill
-        // that disappears into the local UI like YouTube's own pill.
-        const isDark = (() => {
-            try {
-                const bg = getComputedStyle(document.body).backgroundColor || '';
-                const m = bg.match(/rgb[a]?\(([^)]+)\)/);
-                if (!m) return true;
-                const [r, g, b] = m[1].split(',').map(s => parseInt(s, 10));
-                return (r * 0.299 + g * 0.587 + b * 0.114) < 128;
-            } catch (_) { return true; }
-        })();
-        const bgIdle  = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)';
-        const bgHover = isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.1)';
-        const fg      = isDark ? '#fff' : '#0f0f0f';
+        // v2.8.6 — keep oval pill shape but blue (#065fd4) so it's
+        // unambiguously the UVD button on every site.
+        const bgIdle  = '#065fd4';
+        const bgHover = '#0451b5';
 
         const btn = document.createElement('button');
         btn.id = 'uvd-site-btn';
@@ -2994,7 +2987,7 @@
             display: inline-flex; align-items: center; gap: 6px;
             margin: 0;
             padding: 0 14px; height: 36px;
-            background: ${bgIdle}; color: ${fg};
+            background: ${bgIdle}; color: #fff;
             border: none; border-radius: 18px;
             font-size: 14px; font-weight: 500; cursor: pointer;
             font-family: inherit;
@@ -3003,7 +2996,7 @@
         `;
         btn.addEventListener('mouseover', () => btn.style.background = bgHover);
         btn.addEventListener('mouseout', () => btn.style.background = bgIdle);
-        setHTML(btn, `<svg style="width:22px;height:22px;fill:currentColor;flex-shrink:0;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg><span>${label}</span>`);
+        setHTML(btn, `<svg style="width:18px;height:18px;fill:currentColor;flex-shrink:0;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg><span>${label}</span>`);
         btn.addEventListener('click', () => showDialog());
 
         const parent = anchor.parentElement;
@@ -3080,18 +3073,18 @@
             return;
         }
 
-        // v2.8.5 — match YouTube's native action-bar pill rather than
-        // the old saturated-blue gradient. YouTube uses a translucent
-        // background that's effectively rgba(255,255,255,0.1) over the
-        // dark theme; on light theme it's rgba(0,0,0,0.05). 18px radius,
-        // 8px vertical / 12-16px horizontal padding, Roboto 500.
+        // v2.8.6 — keep the oval / action-bar pill shape from v2.8.5
+        // but restore the saturated YouTube blue (#065fd4) so it's
+        // unambiguously *our* button and visually distinct from the
+        // native Like / Share / native-Download pills. Hover deepens
+        // by ~12%.
         const btn = document.createElement('button');
         btn.id = 'uvd-yt-btn';
-        const bgIdle  = 'rgba(255,255,255,0.1)';
-        const bgHover = 'rgba(255,255,255,0.2)';
+        const bgIdle  = '#065fd4';
+        const bgHover = '#0451b5';
         btn.style.cssText = `
             display: inline-flex; align-items: center; gap: 6px;
-            padding: 0 12px; height: 36px;
+            padding: 0 14px; height: 36px;
             margin-left: 8px;
             background: ${bgIdle}; color: #fff;
             border: none; border-radius: 18px;
@@ -3100,15 +3093,11 @@
             transition: background 0.15s;
             vertical-align: middle; white-space: nowrap;
         `;
-        // Trusted Types wrapper — see top of file (BUG-003 fix).
-        setHTML(btn, `<svg style="width:24px;height:24px;fill:currentColor;flex-shrink:0;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg><span>UVD</span>`);
+        setHTML(btn, `<svg style="width:18px;height:18px;fill:currentColor;flex-shrink:0;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg><span>Download</span>`);
         btn.addEventListener('mouseover', () => btn.style.background = bgHover);
         btn.addEventListener('mouseout', () => btn.style.background = bgIdle);
         btn.addEventListener('click', showDialog);
         container.appendChild(btn);
-        // Now that the inline button is present, drop the FAB on
-        // YouTube too — the corner circle was redundant once the pill
-        // landed in the action bar.
         hideFab();
     }
 
