@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Video Download (NewPipe-Style)
 // @namespace    http://tampermonkey.net/
-// @version      2.8.4
+// @version      2.8.5
 // @description  Detects video elements on any website and offers full NewPipe-style download options (resolution, format, codec, audio tracks, subtitles, thread count)
 // @author       BarnsL
 // @updateURL    https://raw.githubusercontent.com/BarnsL/universal-video-download/main/universal-video-download.user.js
@@ -2730,8 +2730,12 @@
         // inject the inline button until it sticks (YouTube's action-
         // bar DOM isn't always present at first load).
         if (CONFIG.supportedSites.youtube.test(location.hostname) && location.pathname === '/watch') {
-            showFab();
             if (!document.getElementById('uvd-yt-btn')) injectYouTubeButton();
+            // v2.8.5 — only show the FAB on YouTube if the inline pill
+            // failed to inject (DOM not ready yet). Once the pill is
+            // present, drop the FAB; the corner circle was redundant.
+            if (document.getElementById('uvd-yt-btn')) hideFab();
+            else showFab();
             return;
         }
 
@@ -2965,20 +2969,41 @@
         opts = opts || {};
         const align = opts.align || 'center';  // 'center' | 'inherit'
 
+        // v2.8.5 — match YouTube's native action-bar pill style. The
+        // earlier saturated-blue gradient stood out way too much next
+        // to subdued site UI (animepahe, wcoanimedub, etc.). Detect a
+        // dark vs light page background and pick a translucent fill
+        // that disappears into the local UI like YouTube's own pill.
+        const isDark = (() => {
+            try {
+                const bg = getComputedStyle(document.body).backgroundColor || '';
+                const m = bg.match(/rgb[a]?\(([^)]+)\)/);
+                if (!m) return true;
+                const [r, g, b] = m[1].split(',').map(s => parseInt(s, 10));
+                return (r * 0.299 + g * 0.587 + b * 0.114) < 128;
+            } catch (_) { return true; }
+        })();
+        const bgIdle  = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)';
+        const bgHover = isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.1)';
+        const fg      = isDark ? '#fff' : '#0f0f0f';
+
         const btn = document.createElement('button');
         btn.id = 'uvd-site-btn';
         btn.title = 'Universal Video Download — open the streams dialog (Ctrl+Shift+D)';
         btn.style.cssText = `
             display: inline-flex; align-items: center; gap: 6px;
             margin: 0;
-            padding: 9px 16px;
-            background: linear-gradient(135deg, #065fd4, #3ea6ff);
-            color: #fff; border: none; border-radius: 8px;
-            font-size: 13px; font-weight: 500; cursor: pointer;
-            box-shadow: 0 2px 8px rgba(6,95,212,0.3);
+            padding: 0 14px; height: 36px;
+            background: ${bgIdle}; color: ${fg};
+            border: none; border-radius: 18px;
+            font-size: 14px; font-weight: 500; cursor: pointer;
             font-family: inherit;
+            transition: background 0.15s;
+            white-space: nowrap; vertical-align: middle;
         `;
-        setHTML(btn, `<svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> ${label}`);
+        btn.addEventListener('mouseover', () => btn.style.background = bgHover);
+        btn.addEventListener('mouseout', () => btn.style.background = bgIdle);
+        setHTML(btn, `<svg style="width:22px;height:22px;fill:currentColor;flex-shrink:0;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg><span>${label}</span>`);
         btn.addEventListener('click', () => showDialog());
 
         const parent = anchor.parentElement;
@@ -3055,23 +3080,36 @@
             return;
         }
 
+        // v2.8.5 — match YouTube's native action-bar pill rather than
+        // the old saturated-blue gradient. YouTube uses a translucent
+        // background that's effectively rgba(255,255,255,0.1) over the
+        // dark theme; on light theme it's rgba(0,0,0,0.05). 18px radius,
+        // 8px vertical / 12-16px horizontal padding, Roboto 500.
         const btn = document.createElement('button');
         btn.id = 'uvd-yt-btn';
+        const bgIdle  = 'rgba(255,255,255,0.1)';
+        const bgHover = 'rgba(255,255,255,0.2)';
         btn.style.cssText = `
             display: inline-flex; align-items: center; gap: 6px;
-            padding: 8px 16px; margin-left: 8px;
-            background: #065fd4; color: #fff; border: none;
-            border-radius: 18px; font-size: 14px; font-weight: 500;
-            cursor: pointer; font-family: 'Roboto', sans-serif;
-            transition: background 0.2s;
-            vertical-align: middle;
+            padding: 0 12px; height: 36px;
+            margin-left: 8px;
+            background: ${bgIdle}; color: #fff;
+            border: none; border-radius: 18px;
+            font-size: 14px; font-weight: 500;
+            cursor: pointer; font-family: 'Roboto', 'Arial', sans-serif;
+            transition: background 0.15s;
+            vertical-align: middle; white-space: nowrap;
         `;
         // Trusted Types wrapper — see top of file (BUG-003 fix).
-        setHTML(btn, `<svg style="width:16px;height:16px;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg> Download`);
-        btn.addEventListener('mouseover', () => btn.style.background = '#0051b5');
-        btn.addEventListener('mouseout', () => btn.style.background = '#065fd4');
+        setHTML(btn, `<svg style="width:24px;height:24px;fill:currentColor;flex-shrink:0;" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg><span>UVD</span>`);
+        btn.addEventListener('mouseover', () => btn.style.background = bgHover);
+        btn.addEventListener('mouseout', () => btn.style.background = bgIdle);
         btn.addEventListener('click', showDialog);
         container.appendChild(btn);
+        // Now that the inline button is present, drop the FAB on
+        // YouTube too — the corner circle was redundant once the pill
+        // landed in the action bar.
+        hideFab();
     }
 
     // ==================== AtoZ/Rustici Download Button ====================
