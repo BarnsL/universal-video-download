@@ -37,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 
 _real_print = print  # capture before any further indirection
@@ -452,7 +452,21 @@ def _probe_tools_once() -> dict:
     return out
 
 
-_tools_cache = _probe_tools_once()
+# v1.1.1 — probe in a background thread so the helper binds its port
+# immediately instead of waiting up to 8s for two subprocess.run calls
+# at module-import time. On Windows, `yt-dlp.exe --version` can take
+# 25+ seconds the first time it runs after install (SmartScreen scan +
+# Python startup), and the synchronous probe was making the userscript's
+# detectHelper() time out before the helper even bound 127.0.0.1:34899.
+#
+# /health reads _tools_cache; if the probe hasn't finished yet the
+# dict just shows {None, None} for a couple seconds, then fills in.
+_tools_cache: dict = {"yt-dlp": None, "ffmpeg": None}
+def _probe_tools_async() -> None:
+    global _tools_cache
+    result = _probe_tools_once()
+    _tools_cache = result
+threading.Thread(target=_probe_tools_async, daemon=True).start()
 
 
 def ensure_dir(p: Path) -> None:
